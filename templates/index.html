@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ascibasi - Turk Mutfagi Tarif Chatbot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+    <script>
+        const savedTheme = localStorage.getItem('theme');
+        if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+    </script>
+</head>
+<body>
+    <!-- ========== LOGIN/REGISTER MODAL ========== -->
+    <div class="modal-overlay" id="authModal" style="display:none;">
+        <div class="modal-box auth-modal-box">
+            <div class="modal-header">
+                <div class="auth-logo">👨‍🍳</div>
+                <h3 id="authModalTitle">Giris Yap</h3>
+                <div class="auth-subtitle">Ascibasi'na Hos Geldin</div>
+            </div>
+            <div class="modal-body">
+                <div id="authError" class="auth-error" style="display:none;"></div>
+                <label>Kullanici Adi</label>
+                <input type="text" id="authUsername" placeholder="Kullanici adi..." autocomplete="username">
+                <label>Sifre</label>
+                <input type="password" id="authPassword" placeholder="Sifre..." autocomplete="current-password">
+            </div>
+            <div class="modal-footer auth-modal-footer">
+                <button class="modal-save" id="authSubmitBtn" onclick="submitAuth()">Giris Yap</button>
+            </div>
+            <div class="auth-switch">
+                <span id="authSwitchText">Hesabin yok mu?</span>
+                <button id="authSwitchBtn" onclick="toggleAuthMode()">Kayit Ol</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="app-layout">
+        <!-- ========== SIDEBAR ========== -->
+        <aside class="sidebar" id="sidebar">
+            <!-- Sidebar Tab Secici -->
+            <div class="sidebar-tabs">
+                <button class="sidebar-tab active" onclick="switchSidebarTab('chats', this)">Sohbetler</button>
+                <button class="sidebar-tab" onclick="switchSidebarTab('books', this)">Tarif Defteri</button>
+                <button class="sidebar-tab" onclick="switchSidebarTab('ingredients', this)">Malzemeler</button>
+            </div>
+
+            <!-- Sohbetler Paneli -->
+            <div class="sidebar-panel" id="panelChats">
+                <div class="sidebar-panel-header">
+                    <div class="sidebar-panel-header-row">
+                        <button class="new-chat-btn" onclick="newChat()">+ Yeni Sohbet</button>
+                        <button class="new-folder-btn" onclick="promptNewChatFolder()">+ Yeni Klasor</button>
+                    </div>
+                </div>
+                <div class="session-list" id="sessionList"></div>
+                <div class="trash-button-container">
+                    <button class="trash-sidebar-btn" onclick="openTrashPanel()">
+                        🗑 Cop Kutusu
+                        <span class="trash-badge" id="trashBadge" style="display:none;">0</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tarif Defteri Paneli -->
+            <div class="sidebar-panel" id="panelBooks" style="display:none;">
+                <div class="sidebar-panel-header">
+                    <div class="book-panel-actions">
+                        <button class="new-chat-btn" onclick="promptNewBook()">+ Yeni Defter</button>
+                    </div>
+                    <div class="book-search-box">
+                        <input type="text" id="bookSearchInput" placeholder="Tariflerde ara..." oninput="searchSavedRecipes()">
+                    </div>
+                </div>
+                <div class="book-search-results" id="bookSearchResults" style="display:none;"></div>
+                <div class="book-tree" id="bookTree"></div>
+                <!-- Alisveris Listem -->
+                <div class="shopping-section">
+                    <div class="shopping-section-header" onclick="toggleShoppingSection()">
+                        🛒 Alisveris Listem
+                        <span id="shoppingToggleIcon" style="font-size:11px;">&#9654;</span>
+                    </div>
+                    <div class="shopping-list-container" id="shoppingListContainer" style="display:none;"></div>
+                </div>
+            </div>
+
+            <!-- Malzemeler Paneli (Feature 1) -->
+            <div class="sidebar-panel" id="panelIngredients" style="display:none;">
+                <div class="sidebar-panel-header">
+                    <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;">Elindeki Malzemeler</label>
+                    <textarea id="sidebarIngredientInput" class="ingredient-textarea" rows="3" placeholder="Ornek: patates, sogan, domates, kiyma..."></textarea>
+                    <div class="ingredient-chips" id="ingredientChips">
+                        <button class="ingredient-chip" onclick="addIngredientChip('Kiyma')">Kiyma</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Patates')">Patates</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Sogan')">Sogan</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Domates')">Domates</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Biber')">Biber</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Pirinc')">Pirinc</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Bulgur')">Bulgur</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Tavuk')">Tavuk</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Patlican')">Patlican</button>
+                        <button class="ingredient-chip" onclick="addIngredientChip('Kabak')">Kabak</button>
+                    </div>
+                    <button class="new-chat-btn" style="width:100%;margin-top:10px;" onclick="sidebarSearchByIngredients()">Tarif Bul</button>
+                    <div class="ingredient-hint">Malzemeleri virgul ile ayirarak yaz veya yukaridaki etiketlere tikla.</div>
+                </div>
+            </div>
+
+            <!-- Sidebar Profile -->
+            <div class="sidebar-profile" id="sidebarProfile" onclick="openProfilePanel()" style="cursor:pointer;">
+                <div class="sidebar-profile-avatar" id="profileAvatar">?</div>
+                <div class="sidebar-profile-info">
+                    <div class="sidebar-profile-name" id="profileName">Misafir</div>
+                    <div class="sidebar-profile-label">Ascibasi Uyesi</div>
+                </div>
+                <button class="sidebar-logout" onclick="event.stopPropagation(); logoutUser()">Cikis</button>
+            </div>
+        </aside>
+
+        <!-- ========== CHAT ALANI ========== -->
+        <div class="chat-container" id="chatContainer">
+            <div class="chat-header">
+                <button class="sidebar-toggle" onclick="toggleSidebar()">&#9776;</button>
+                <div class="avatar">&#x1F468;&#x200D;&#x1F373;</div>
+                <div class="info">
+                    <h1>Ascibasi</h1>
+                    <p>Turk Mutfagi Tarif Asistani</p>
+                </div>
+                <div class="header-actions">
+                    <button onclick="toggleTheme()" title="Tema Degistir"><span id="themeIcon">&#9728;&#65039;</span></button>
+                </div>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome-message" id="welcome">
+                    <div class="welcome-hero">👨‍🍳</div>
+                    <h2>Ascibasi'na Hos Geldin!</h2>
+                    <p>Anadolu'nun en lezzetli tariflerini seninle paylasiyorum.<br>
+                    Bir yemek sor, adim adim anlatayim!</p>
+                    <div class="category-tabs">
+                        <button class="category-tab active" onclick="filterCategory('all', this)">Tumu</button>
+                        <button class="category-tab" onclick="filterCategory('Corba', this)">Corbalar</button>
+                        <button class="category-tab" onclick="filterCategory('Ana Yemek', this)">Ana Yemekler</button>
+                        <button class="category-tab" onclick="filterCategory('Tatli', this)">Tatlilar</button>
+                        <button class="category-tab" onclick="filterCategory('Meze', this)">Mezeler</button>
+                        <button class="category-tab" onclick="filterCategory('Kahvaltilik', this)">Kahvaltilik</button>
+                    </div>
+                    <div class="suggestions" id="suggestionButtons"></div>
+                    <div class="suggestions-special">
+                        <button class="ingredient-btn" onclick="openIngredientsTab()">🥕 Malzemelerimle Tarif Bul</button>
+                        <button class="menu-plan-btn" onclick="requestMenuPlan()">📅 Haftalik Menu Olustur</button>
+                    </div>
+                </div>
+                <div class="typing-indicator" id="typing"><span></span><span></span><span></span></div>
+            </div>
+
+            <button class="scroll-bottom-btn" id="scrollBottomBtn" onclick="scrollToBottom()">&darr;</button>
+
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="Bir yemek tarifi sorun..." autocomplete="off">
+                <button id="sendBtn" onclick="sendMessage()">&#10148;</button>
+            </div>
+        </div>
+
+        <!-- ========== TARIF GORUNTULEME PANELI ========== -->
+        <div class="recipe-viewer" id="recipeViewer" style="display:none;">
+            <div class="viewer-header">
+                <button class="viewer-back" onclick="closeRecipeViewer()">&larr; Geri</button>
+                <span class="viewer-title" id="viewerTitle"></span>
+                <button class="viewer-pdf" onclick="exportCurrentPdf()">PDF Indir</button>
+            </div>
+            <div class="viewer-content" id="viewerContent"></div>
+        </div>
+        <!-- ========== PROFIL AYARLARI PANELI (Feature 2) ========== -->
+        <div class="recipe-viewer" id="profilePanel" style="display:none;">
+            <div class="viewer-header">
+                <button class="viewer-back" onclick="closeProfilePanel()">&larr; Geri</button>
+                <span class="viewer-title">Profil Ayarlari</span>
+            </div>
+            <div class="viewer-content" id="profilePanelContent">
+                <div class="profile-settings-section">
+                    <h3 class="profile-section-title">Hesap Bilgileri</h3>
+                    <div class="profile-info-row">
+                        <span class="profile-info-label">Kullanici ID</span>
+                        <span class="profile-info-value" id="profileInfoUserId">-</span>
+                    </div>
+                    <div class="profile-info-row">
+                        <span class="profile-info-label">Kayit Tarihi</span>
+                        <span class="profile-info-value" id="profileInfoCreatedAt">-</span>
+                    </div>
+                </div>
+
+                <div class="profile-settings-section">
+                    <h3 class="profile-section-title">Kullanici Adi Degistir</h3>
+                    <div class="profile-form-row">
+                        <input type="text" id="profileNewUsername" class="profile-input" placeholder="Yeni kullanici adi...">
+                        <button class="profile-save-btn" onclick="saveProfileUsername()">Kaydet</button>
+                    </div>
+                    <div id="profileUsernameError" class="profile-error" style="display:none;"></div>
+                </div>
+
+                <div class="profile-settings-section">
+                    <h3 class="profile-section-title">Sifre Degistir</h3>
+                    <div class="profile-form-row">
+                        <input type="password" id="profileOldPassword" class="profile-input" placeholder="Mevcut sifre...">
+                    </div>
+                    <div class="profile-form-row">
+                        <input type="password" id="profileNewPassword" class="profile-input" placeholder="Yeni sifre...">
+                        <button class="profile-save-btn" onclick="saveProfilePassword()">Kaydet</button>
+                    </div>
+                    <div id="profilePasswordError" class="profile-error" style="display:none;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== COP KUTUSU PANELI (Feature 3) ========== -->
+        <div class="recipe-viewer" id="trashPanel" style="display:none;">
+            <div class="viewer-header">
+                <button class="viewer-back" onclick="closeTrashPanel()">&larr; Geri</button>
+                <span class="viewer-title">Cop Kutusu</span>
+                <button class="viewer-pdf" onclick="emptyTrash()">Cop Kutusunu Bosalt</button>
+            </div>
+            <div class="viewer-content" id="trashPanelContent"></div>
+        </div>
+    </div>
+
+    <!-- Sidebar Overlay (mobil) -->
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+
+    <!-- ========== FAVORILE MODAL ========== -->
+    <div class="modal-overlay" id="favModal" style="display:none;">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h3>Tarifi Kaydet</h3>
+                <button class="modal-close" onclick="closeFavModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <label>Tarif Adi</label>
+                <input type="text" id="favTitle" placeholder="Tarif adi...">
+
+                <label>Defter Sec</label>
+                <div class="modal-row">
+                    <select id="favBookSelect"><option value="">-- Defter secin --</option></select>
+                    <button class="modal-inline-btn" onclick="inlineNewBook()">+ Yeni</button>
+                </div>
+                <input type="text" id="favNewBookInput" placeholder="Yeni defter adi..." style="display:none;">
+
+                <label>Klasor Sec <span style="opacity:0.5;font-size:11px;">(opsiyonel - bos birakirsan "Genel"e kaydedilir)</span></label>
+                <div class="modal-row">
+                    <select id="favFolderSelect"><option value="">-- Klasorsuz kaydet --</option></select>
+                    <button class="modal-inline-btn" onclick="inlineNewFolder()">+ Yeni</button>
+                </div>
+                <input type="text" id="favNewFolderInput" placeholder="Yeni klasor adi..." style="display:none;">
+            </div>
+            <div class="modal-footer">
+                <button class="modal-cancel" onclick="closeFavModal()">Iptal</button>
+                <button class="modal-save" onclick="saveFavorite()">Kaydet</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Bildirim -->
+    <div class="toast" id="toast"></div>
+
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
