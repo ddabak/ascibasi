@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: turkrecipes
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5436:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d turkrecipes"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    restart: always
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/turkrecipes
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}
+      PASSWORD_SALT: ${PASSWORD_SALT:-ascibasi_default_salt_2026}
+    env_file:
+      - .env
+
+volumes:
+  pgdata:
