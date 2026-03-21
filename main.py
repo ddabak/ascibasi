@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import uuid
@@ -29,6 +30,7 @@ from database import (
     init_db, get_db, Recipe, ChatHistory,
     RecipeBook, BookFolder, SavedRecipe, User,
     SessionMeta, RecipeCache, ShoppingList, ChatFolder,
+    SharedMessage,
 )
 
 load_dotenv()
@@ -50,8 +52,11 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+import resend
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
+resend.api_key = os.getenv("RESEND_API_KEY", "")
 
 
 async def search_references(food_name: str) -> List[str]:
@@ -62,10 +67,19 @@ async def search_references(food_name: str) -> List[str]:
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
     }
+    # Daha spesifik sorgu: yemek adini ve "tarif" kelimesini birlikte ara
+    clean_name = food_name.strip().lower()
     payload = {
         "model": "sonar",
         "messages": [
-            {"role": "user", "content": f"{food_name} tarifi icin en iyi Turkce tarif sitelerini bul"}
+            {
+                "role": "system",
+                "content": "Sadece sorulan yemegin tarifinin bulundugu sayfa URL'lerini don. Ana sayfa linkleri verme. Her link dogrudan o tarifin sayfasina gitmeli.",
+            },
+            {
+                "role": "user",
+                "content": f'"{clean_name}" tarifi icin dogrudan tarif sayfasi URL\'leri bul. Sadece {clean_name} tarifinin oldugu sayfalari ver, baska tariflerin sayfalarini verme.',
+            },
         ],
     }
     try:
@@ -73,7 +87,27 @@ async def search_references(food_name: str) -> List[str]:
             response = await http_client.post(url, headers=headers, json=payload, timeout=10.0)
             if response.status_code == 200:
                 data = response.json()
-                return data.get("citations", [])[:3]
+                citations = data.get("citations", [])
+                # URL'lerde yemek adinin gecip gecmedigini kontrol et
+                name_parts = clean_name.replace("ı", "i").replace("ö", "o").replace("ü", "u").replace("ş", "s").replace("ç", "c").replace("ğ", "g").split()
+                filtered = []
+                for c in citations:
+                    c_lower = c.lower()
+                    # Ana sayfa linklerini atla
+                    from urllib.parse import urlparse
+                    path = urlparse(c).path.strip("/")
+                    if not path or path.count("/") == 0 and len(path) < 3:
+                        continue
+                    # URL'de yemek adinin en az bir kelimesi geciyorsa ekle
+                    url_decoded = c_lower.replace("-", " ").replace("_", " ").replace("%", " ")
+                    if any(part in url_decoded for part in name_parts if len(part) > 2):
+                        filtered.append(c)
+                # Filtrelenmis sonuc varsa onu, yoksa ilk 3 citation'i (ana sayfa haric) dondur
+                if filtered:
+                    return filtered[:3]
+                # Ana sayfa olmayan citation'lari dondur
+                non_home = [c for c in citations if len(urlparse(c).path.strip("/")) > 3]
+                return non_home[:3]
     except Exception as e:
         logger.error("Perplexity referans arama hatasi: %s", str(e))
     return []
@@ -91,21 +125,29 @@ Her tarifi asagidaki sirayla ve formatta anlat:
 
 **ONEMLI: En basta yemegin adini mutlaka "## Yemek Adi Tarifi" formatinda Markdown basligi olarak yaz.** Ornegin: ## Karniyarik Tarifi, ## Mercimek Corbasi Tarifi, ## Brokoli Salatasi Tarifi. Bu baslik her zaman ilk satirda olmali.
 
-1. **Yemek Hakkinda Kisa Tanitim**: Yemegin hangi yoreye ait oldugu, hikayesi veya kulturel onemi (2-3 cumle).
+**FORMATLAMA KURALI: Bolum basliklarini (Malzeme Listesi, Pisirme Adimlari vb.) numaralandirma. Bunlari sadece ### ile yaz. Numaralandirmayi SADECE pisirme adimlarinin icinde kullan.**
 
-2. **Malzeme Listesi**: Her malzemeyi miktariyla birlikte alt alta yaz. Olculeri net ver (su bardagi, yemek kasigi, gram, adet). Malzemenin ne ise yaradigini gerekirse parantez icinde belirt.
+### Yemek Hakkinda Kisa Tanitim
+Yemegin hangi yoreye ait oldugu, hikayesi veya kulturel onemi (2-3 cumle).
 
-3. **Hazirlik Asamasi**: Pisirmeye baslamadan once yapilmasi gereken tum hazirliklari anlat (yikama, dograma, ayiklama, bekletme). Dograma sekillerini tarif et: "parmak kalinliginda dograyin", "julyen kesin", "ince ince kiyin" gibi.
+### Malzeme Listesi
+Her malzemeyi miktariyla birlikte alt alta yaz. Olculeri net ver (su bardagi, yemek kasigi, gram, adet). Malzemenin ne ise yaradigini gerekirse parantez icinde belirt.
 
-4. **Pisirme Adimlari**: Her adimi numaralandirarak anlat. Her adimda sunlar mutlaka olsun:
-   - Ne yapilacak (eylem)
-   - Nasil yapilacak (teknik detay: "kisik ateste", "tahta kasikla karistirarak", "kapagi aralik birakarak")
-   - Ne kadar sure yapilacak (dakika/saat)
-   - Hazir oldugunu nasil anlayacak (gorsel/koku/doku ipucu: "kenarlari kizarinca", "uzeri fokurdayinca", "kasigin arkasina yapisinca", "mis gibi kokmaya baslayinca")
+### Hazirlik Asamasi
+Pisirmeye baslamadan once yapilmasi gereken tum hazirliklari anlat (yikama, dograma, ayiklama, bekletme). Dograma sekillerini tarif et: "parmak kalinliginda dograyin", "julyen kesin", "ince ince kiyin" gibi.
 
-5. **Puf Noktalari**: En az 2-3 puf noktasi ver. Bunlar gercekten fark yaratan, deneyimle ogrenilen pratik bilgiler olsun.
+### Pisirme Adimlari
+Her adimi 1'den baslayarak numaralandir. Her adimda sunlar mutlaka olsun:
+- Ne yapilacak (eylem)
+- Nasil yapilacak (teknik detay: "kisik ateste", "tahta kasikla karistirarak")
+- Ne kadar sure yapilacak (dakika/saat)
+- Hazir oldugunu nasil anlayacak (gorsel/koku/doku ipucu: "kenarlari kizarinca", "uzeri fokurdayinca")
 
-6. **Servis Onerisi**: Yaninda ne gider, nasil sunulur, sicak mi soguk mu servis edilir.
+### Puf Noktalari
+En az 2-3 puf noktasi ver. Bunlar gercekten fark yaratan, deneyimle ogrenilen pratik bilgiler olsun.
+
+### Servis Onerisi
+Yaninda ne gider, nasil sunulur, sicak mi soguk mu servis edilir.
 
 ## KESIN KURALLAR
 - SADECE Turk yemek tarifleri hakkinda konus. Baska herhangi bir konuda kesinlikle cevap verme.
@@ -311,6 +353,59 @@ def generate_session_title(user_message: str, gpt_response: Optional[str] = None
 
 SALT = os.getenv("PASSWORD_SALT", "ascibasi_default_salt_2026")
 
+
+def validate_password(password: str) -> Optional[str]:
+    """Sifre kurallarini kontrol et. Hata varsa mesaj doner, yoksa None."""
+    if len(password) < 8:
+        return "Sifre en az 8 karakter olmali"
+    if not re.search(r'[a-z]', password):
+        return "Sifre en az bir kucuk harf icermeli"
+    if not re.search(r'[A-Z]', password):
+        return "Sifre en az bir buyuk harf icermeli"
+    if not re.search(r'[0-9]', password):
+        return "Sifre en az bir rakam icermeli"
+    if not re.search(r'[!@#$%^&*()_+\-=\[\]{};:\'",.<>?/\\|`~]', password):
+        return "Sifre en az bir ozel karakter icermeli (!@#$%^&* vb.)"
+    return None
+
+
+def generate_verification_code() -> str:
+    """6 haneli dogrulama kodu olustur."""
+    return str(random.randint(100000, 999999))
+
+
+def send_verification_email(email: str, code: str, username: str) -> bool:
+    """Resend ile dogrulama maili gonder."""
+    if not resend.api_key:
+        logger.error("RESEND_API_KEY ayarlanmamis")
+        return False
+    try:
+        resend.Emails.send({
+            "from": "Ascibasi <onboarding@resend.dev>",
+            "to": [email],
+            "subject": "Ascibasi - E-posta Dogrulama Kodunuz",
+            "html": f"""
+            <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;
+                        padding: 30px; background: #1a1a2e; color: #eee; border-radius: 12px;">
+                <h2 style="color: #e74c3c; text-align: center;">Ascibasi</h2>
+                <p>Merhaba <strong>{username}</strong>,</p>
+                <p>Hesabinizi dogrulamak icin asagidaki kodu kullanin:</p>
+                <div style="text-align: center; margin: 25px 0;">
+                    <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px;
+                                 color: #e74c3c; background: #1e2a4a; padding: 15px 30px;
+                                 border-radius: 8px; display: inline-block;">{code}</span>
+                </div>
+                <p style="color: #999; font-size: 13px;">Bu kod 10 dakika gecerlidir.</p>
+                <p style="color: #999; font-size: 13px;">Bu maili siz talep etmediyseniz dikkate almayin.</p>
+            </div>
+            """,
+        })
+        logger.info("Dogrulama maili gonderildi: %s", email)
+        return True
+    except Exception as e:
+        logger.error("Mail gonderim hatasi: %s", str(e))
+        return False
+
 def hash_password(password: str) -> str:
     """SHA-256 password hashing with salt."""
     salted = SALT + password
@@ -372,7 +467,21 @@ async def health_check(request: Request, db: Session = Depends(get_db)):
 
 class RegisterRequest(BaseModel):
     username: str
+    first_name: str
+    last_name: str
+    birth_date: str
+    email: str
     password: str
+    password_confirm: str
+
+
+class VerifyEmailRequest(BaseModel):
+    email: str
+    code: str
+
+
+class ResendCodeRequest(BaseModel):
+    email: str
 
 
 class LoginRequest(BaseModel):
@@ -382,7 +491,11 @@ class LoginRequest(BaseModel):
 
 class ProfileUpdateRequest(BaseModel):
     user_id: str
-    username: str
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    birth_date: Optional[str] = None
+    email: Optional[str] = None
 
 
 class PasswordChangeRequest(BaseModel):
@@ -392,36 +505,113 @@ class PasswordChangeRequest(BaseModel):
 
 
 @app.post("/api/auth/register")
-@limiter.limit("30/minute")
+@limiter.limit("10/minute")
 async def register(request: Request, req: RegisterRequest, db: Session = Depends(get_db)):
-    """Yeni kullanici kaydi."""
-    if not req.username or not req.password:
-        return Response(content=json.dumps({"error": "Kullanici adi ve sifre gerekli"}), status_code=400, media_type="application/json")
+    """Yeni kullanici kaydi (e-posta dogrulamali)."""
+    if not req.username or not req.password or not req.email or not req.first_name or not req.last_name:
+        return Response(content=json.dumps({"error": "Tum alanlar zorunludur"}), status_code=400, media_type="application/json")
 
     if len(req.username) < 3:
         return Response(content=json.dumps({"error": "Kullanici adi en az 3 karakter olmali"}), status_code=400, media_type="application/json")
 
-    if len(req.password) < 4:
-        return Response(content=json.dumps({"error": "Sifre en az 4 karakter olmali"}), status_code=400, media_type="application/json")
+    if req.password != req.password_confirm:
+        return Response(content=json.dumps({"error": "Sifreler eslesmiyor"}), status_code=400, media_type="application/json")
+
+    pw_error = validate_password(req.password)
+    if pw_error:
+        return Response(content=json.dumps({"error": pw_error}), status_code=400, media_type="application/json")
+
+    # Basit e-posta format kontrolu
+    if "@" not in req.email or "." not in req.email:
+        return Response(content=json.dumps({"error": "Gecerli bir e-posta adresi girin"}), status_code=400, media_type="application/json")
 
     existing = db.query(User).filter(User.username == req.username).first()
     if existing:
         return Response(content=json.dumps({"error": "Bu kullanici adi zaten alinmis"}), status_code=409, media_type="application/json")
 
+    existing_email = db.query(User).filter(User.email == req.email, User.email_verified == True).first()
+    if existing_email:
+        return Response(content=json.dumps({"error": "Bu e-posta adresi zaten kayitli"}), status_code=409, media_type="application/json")
+
+    # Ayni e-posta ile dogrulanmamis eski kayitlari temizle
+    db.query(User).filter(User.email == req.email, User.email_verified == False).delete()
+    db.commit()
+
     user_id = str(uuid.uuid4())
+    code = generate_verification_code()
     user = User(
         user_id=user_id,
         username=req.username,
+        first_name=req.first_name,
+        last_name=req.last_name,
+        birth_date=req.birth_date,
+        email=req.email,
         password_hash=hash_password(req.password),
+        email_verified=False,
+        verification_code=code,
+        verification_code_expires=datetime.utcnow() + timedelta(minutes=10),
     )
     db.add(user)
     db.commit()
-    logger.info("Yeni kullanici kaydoldu: %s", req.username)
-    return {"user_id": user_id, "username": req.username}
+
+    # Dogrulama maili gonder
+    mail_sent = send_verification_email(req.email, code, req.username)
+    if not mail_sent:
+        logger.warning("Dogrulama maili gonderilemedi: %s", req.email)
+
+    logger.info("Yeni kullanici kaydoldu (dogrulama bekliyor): %s", req.username)
+    return {
+        "message": "Kayit basarili. E-posta adresinize dogrulama kodu gonderildi.",
+        "email": req.email,
+        "first_name": req.first_name,
+        "last_name": req.last_name,
+    }
+
+
+@app.post("/api/auth/verify-email")
+@limiter.limit("10/minute")
+async def verify_email(request: Request, req: VerifyEmailRequest, db: Session = Depends(get_db)):
+    """E-posta dogrulama kodunu kontrol et."""
+    user = db.query(User).filter(User.email == req.email, User.email_verified == False).first()
+    if not user:
+        return Response(content=json.dumps({"error": "Kullanici bulunamadi veya zaten dogrulanmis"}), status_code=404, media_type="application/json")
+
+    if not user.verification_code or user.verification_code != req.code:
+        return Response(content=json.dumps({"error": "Dogrulama kodu hatali"}), status_code=400, media_type="application/json")
+
+    if user.verification_code_expires and datetime.utcnow() > user.verification_code_expires:
+        return Response(content=json.dumps({"error": "Dogrulama kodunun suresi dolmus. Yeni kod isteyin."}), status_code=400, media_type="application/json")
+
+    user.email_verified = True
+    user.verification_code = None
+    user.verification_code_expires = None
+    db.commit()
+    logger.info("E-posta dogrulandi: %s (%s)", user.username, req.email)
+    return {"user_id": user.user_id, "username": user.username, "message": "E-posta basariyla dogrulandi"}
+
+
+@app.post("/api/auth/resend-code")
+@limiter.limit("3/minute")
+async def resend_verification_code(request: Request, req: ResendCodeRequest, db: Session = Depends(get_db)):
+    """Dogrulama kodunu tekrar gonder."""
+    user = db.query(User).filter(User.email == req.email, User.email_verified == False).first()
+    if not user:
+        return Response(content=json.dumps({"error": "Kullanici bulunamadi veya zaten dogrulanmis"}), status_code=404, media_type="application/json")
+
+    code = generate_verification_code()
+    user.verification_code = code
+    user.verification_code_expires = datetime.utcnow() + timedelta(minutes=10)
+    db.commit()
+
+    mail_sent = send_verification_email(req.email, code, user.username)
+    if not mail_sent:
+        return Response(content=json.dumps({"error": "Mail gonderilemedi, lutfen tekrar deneyin"}), status_code=500, media_type="application/json")
+
+    return {"message": "Yeni dogrulama kodu gonderildi"}
 
 
 @app.post("/api/auth/login")
-@limiter.limit("30/minute")
+@limiter.limit("10/minute")
 async def login(request: Request, req: LoginRequest, db: Session = Depends(get_db)):
     """Kullanici girisi."""
     if not req.username or not req.password:
@@ -430,6 +620,9 @@ async def login(request: Request, req: LoginRequest, db: Session = Depends(get_d
     user = db.query(User).filter(User.username == req.username).first()
     if not user or not verify_password(req.password, user.password_hash, db, user):
         return Response(content=json.dumps({"error": "Kullanici adi veya sifre hatali"}), status_code=401, media_type="application/json")
+
+    if not user.email_verified:
+        return Response(content=json.dumps({"error": "E-posta adresiniz henuz dogrulanmamis", "needs_verification": True, "email": user.email, "first_name": user.first_name or "", "last_name": user.last_name or ""}), status_code=403, media_type="application/json")
 
     logger.info("Kullanici giris yapti: %s", req.username)
     return {"user_id": user.user_id, "username": user.username}
@@ -440,32 +633,64 @@ async def login(request: Request, req: LoginRequest, db: Session = Depends(get_d
 @app.put("/api/auth/profile")
 @limiter.limit("30/minute")
 async def update_profile(request: Request, req: ProfileUpdateRequest, db: Session = Depends(get_db)):
-    """Kullanici adini degistir."""
-    if not req.username or len(req.username) < 3:
-        return Response(content=json.dumps({"error": "Kullanici adi en az 3 karakter olmali"}), status_code=400, media_type="application/json")
-
+    """Kullanici profil bilgilerini guncelle."""
     user = db.query(User).filter(User.user_id == req.user_id).first()
     if not user:
         return Response(content=json.dumps({"error": "Kullanici bulunamadi"}), status_code=404, media_type="application/json")
 
-    # Check if new username is taken by another user
-    existing = db.query(User).filter(User.username == req.username, User.user_id != req.user_id).first()
-    if existing:
-        return Response(content=json.dumps({"error": "Bu kullanici adi zaten alinmis"}), status_code=409, media_type="application/json")
+    # Kullanici adi degisikligi
+    if req.username is not None:
+        if len(req.username) < 3:
+            return Response(content=json.dumps({"error": "Kullanici adi en az 3 karakter olmali"}), status_code=400, media_type="application/json")
+        existing = db.query(User).filter(User.username == req.username, User.user_id != req.user_id).first()
+        if existing:
+            return Response(content=json.dumps({"error": "Bu kullanici adi zaten alinmis"}), status_code=409, media_type="application/json")
+        user.username = req.username
 
-    old_username = user.username
-    user.username = req.username
+    # Kisisel bilgiler
+    if req.first_name is not None:
+        user.first_name = req.first_name
+    if req.last_name is not None:
+        user.last_name = req.last_name
+    if req.birth_date is not None:
+        user.birth_date = req.birth_date
+
+    # E-posta degisikligi
+    if req.email is not None and req.email != user.email:
+        if "@" not in req.email or "." not in req.email:
+            return Response(content=json.dumps({"error": "Gecerli bir e-posta adresi girin"}), status_code=400, media_type="application/json")
+        existing_email = db.query(User).filter(User.email == req.email, User.email_verified == True, User.user_id != req.user_id).first()
+        if existing_email:
+            return Response(content=json.dumps({"error": "Bu e-posta adresi baska bir hesapta kayitli"}), status_code=409, media_type="application/json")
+        user.email = req.email
+        user.email_verified = False
+        code = generate_verification_code()
+        user.verification_code = code
+        user.verification_code_expires = datetime.utcnow() + timedelta(minutes=10)
+        send_verification_email(req.email, code, user.username)
+
     db.commit()
-    logger.info("Kullanici adi degistirildi: %s -> %s", old_username, req.username)
-    return {"user_id": user.user_id, "username": user.username}
+    logger.info("Profil guncellendi: user_id=%s", req.user_id)
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "birth_date": user.birth_date or "",
+        "email": user.email or "",
+        "email_verified": user.email_verified or False,
+    }
 
 
 @app.put("/api/auth/password")
 @limiter.limit("30/minute")
 async def change_password(request: Request, req: PasswordChangeRequest, db: Session = Depends(get_db)):
     """Kullanici sifresini degistir."""
-    if not req.new_password or len(req.new_password) < 4:
-        return Response(content=json.dumps({"error": "Yeni sifre en az 4 karakter olmali"}), status_code=400, media_type="application/json")
+    if not req.new_password:
+        return Response(content=json.dumps({"error": "Yeni sifre gerekli"}), status_code=400, media_type="application/json")
+    pw_error = validate_password(req.new_password)
+    if pw_error:
+        return Response(content=json.dumps({"error": pw_error}), status_code=400, media_type="application/json")
 
     user = db.query(User).filter(User.user_id == req.user_id).first()
     if not user:
@@ -491,6 +716,11 @@ async def get_profile(request: Request, user_id: str, db: Session = Depends(get_
     return {
         "user_id": user.user_id,
         "username": user.username,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "birth_date": user.birth_date or "",
+        "email": user.email or "",
+        "email_verified": user.email_verified or False,
         "created_at": user.created_at.isoformat() if user.created_at else None,
     }
 
@@ -780,6 +1010,48 @@ async def move_session_to_folder(request: Request, session_id: str, req: Session
     return {"ok": True, "session_id": session_id, "folder_id": req.folder_id}
 
 
+# ========== Kullanim Limiti ==========
+DAILY_MESSAGE_LIMIT = 20
+
+
+def check_message_limit(db: Session, user_id: str) -> dict:
+    """Kullanicinin kalan mesaj hakkini kontrol et (24 saatlik kayan pencere)."""
+    if not user_id:
+        return {"allowed": True, "remaining": DAILY_MESSAGE_LIMIT}
+
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    recent_messages = (
+        db.query(ChatHistory)
+        .filter(
+            ChatHistory.user_id == user_id,
+            ChatHistory.role == "user",
+            ChatHistory.created_at >= cutoff,
+        )
+        .order_by(ChatHistory.created_at.asc())
+        .all()
+    )
+
+    recent_count = len(recent_messages)
+    remaining = max(0, DAILY_MESSAGE_LIMIT - recent_count)
+
+    result = {"allowed": remaining > 0, "remaining": remaining}
+
+    # Kullanilmis hak varsa, en eski mesajin ne zaman yenilenecegini hesapla
+    if recent_count > 0 and recent_messages[0].created_at:
+        next_credit = recent_messages[0].created_at + timedelta(hours=24)
+        minutes_left = max(1, int((next_credit - datetime.utcnow()).total_seconds() / 60))
+        result["minutes_until_next"] = minutes_left
+
+    return result
+
+
+@app.get("/api/chat/limit")
+@limiter.limit("30/minute")
+async def get_chat_limit(request: Request, user_id: str, db: Session = Depends(get_db)):
+    """Kullanicinin kalan mesaj hakkini getir."""
+    return check_message_limit(db, user_id)
+
+
 # ========== Streaming Chat API (SSE) ==========
 
 @app.post("/api/chat/stream")
@@ -791,6 +1063,24 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
     """
     session_id = req.session_id or str(uuid.uuid4())
     logger.info("Streaming chat istegi - session: %s, mesaj: %s", session_id, req.message[:80])
+
+    # Kullanim limiti kontrolu
+    limit_info = check_message_limit(db, req.user_id)
+    if not limit_info["allowed"]:
+        mins = limit_info.get("minutes_until_next", 60)
+        if mins >= 60:
+            time_text = f"{mins // 60} saat {mins % 60} dakika"
+        else:
+            time_text = f"{mins} dakika"
+        return Response(
+            content=json.dumps({
+                "error": f"Gunluk mesaj limitiniz doldu. Sonraki hakkiniz {time_text} sonra yenilenir.",
+                "remaining": 0,
+                "minutes_until_next": mins,
+            }),
+            status_code=429,
+            media_type="application/json",
+        )
 
     # Recipe cache kontrolu
     cache_key = normalize_recipe_query(req.message)
@@ -847,9 +1137,24 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
                 logger.error("GPT streaming hatasi: %s", str(e))
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Yapay zeka yanit veremedi.'})}\n\n"
 
-            # Perplexity referanslari (sadece yeni yanit icin)
-            search_term = recipes[0].name if recipes else req.message
-            references = await search_references(search_term)
+            # Perplexity referanslari (sadece tek tarif yaniti icin, menu/oneri/selamlama haric)
+            references = []
+            msg_lower = req.message.lower().strip()
+            is_greeting = msg_lower in GREETING_WORDS or len(msg_lower) < 5
+            # Menu/liste yanitlarini tespit et
+            day_words = ["pazartesi", "sali", "çarşamba", "perşembe", "cuma", "cumartesi", "pazar"]
+            is_menu = sum(1 for d in day_words if d in full_reply.lower()) >= 3
+            if not is_greeting and not is_menu and full_reply:
+                # GPT yanitindan tarif adini cikar (en dogru sonuc icin)
+                recipe_title = extract_title_from_response(full_reply)
+                if recipe_title:
+                    search_term = recipe_title
+                elif recipes:
+                    search_term = recipes[0].name
+                else:
+                    search_term = None
+                if search_term:
+                    references = await search_references(search_term)
 
             # Yaniti + referanslari onbellege kaydet
             if cache_key and full_reply:
@@ -903,6 +1208,15 @@ async def chat(request: Request, req: ChatRequest, db: Session = Depends(get_db)
     session_id = req.session_id or str(uuid.uuid4())
     logger.info("Chat istegi - session: %s, mesaj: %s", session_id, req.message[:80])
 
+    # Kullanim limiti kontrolu
+    limit_info = check_message_limit(db, req.user_id)
+    if not limit_info["allowed"]:
+        return Response(
+            content=json.dumps({"error": "Gunluk mesaj limitiniz doldu."}),
+            status_code=429,
+            media_type="application/json",
+        )
+
     # Cache kontrolu
     cache_key = normalize_recipe_query(req.message)
     if cache_key:
@@ -932,8 +1246,18 @@ async def chat(request: Request, req: ChatRequest, db: Session = Depends(get_db)
         reply = "Bir hata olustu, lutfen tekrar deneyin."
 
     references = []
-    search_term = recipes[0].name if recipes else req.message
-    references = await search_references(search_term)
+    msg_lower = req.message.lower().strip()
+    is_greeting = msg_lower in GREETING_WORDS or len(msg_lower) < 5
+    if not is_greeting and reply:
+        recipe_title = extract_title_from_response(reply)
+        if recipe_title:
+            search_term = recipe_title
+        elif recipes:
+            search_term = recipes[0].name
+        else:
+            search_term = None
+        if search_term:
+            references = await search_references(search_term)
 
     # Cache'e kaydet
     if cache_key and reply and reply != "Bir hata olustu, lutfen tekrar deneyin.":
@@ -1607,3 +1931,95 @@ async def create_shopping_list_from_recipe(request: Request, req: ShoppingListFr
         "items": ingredients,
         "created_at": sl.created_at.isoformat() if sl.created_at else None,
     }
+
+
+# ================================================================
+# MESAJ PAYLASIMI API
+# ================================================================
+
+@app.delete("/api/sessions/{session_id}/rewind")
+@limiter.limit("30/minute")
+async def rewind_session(request: Request, session_id: str, count: int = 1, db: Session = Depends(get_db)):
+    """Sohbetin son N mesajini sil (mesaj duzenleme icin)."""
+    messages = (
+        db.query(ChatHistory)
+        .filter(ChatHistory.session_id == session_id)
+        .order_by(ChatHistory.id.desc())
+        .limit(count)
+        .all()
+    )
+    for m in messages:
+        db.delete(m)
+    db.commit()
+    logger.info("Sohbet geri sarildi: session=%s, silinen=%d", session_id, len(messages))
+    return {"ok": True, "deleted": len(messages)}
+
+
+class ShareMessageRequest(BaseModel):
+    content: str
+
+
+@app.post("/api/messages/share")
+@limiter.limit("30/minute")
+async def share_message(request: Request, req: ShareMessageRequest, db: Session = Depends(get_db)):
+    """Herhangi bir mesaj icin paylasim linki olustur."""
+    if not req.content or len(req.content.strip()) < 5:
+        return Response(content=json.dumps({"error": "Paylasim icin icerik gerekli"}), status_code=400, media_type="application/json")
+
+    token = secrets.token_urlsafe(16)
+    title = extract_title_from_response(req.content)
+    if not title:
+        first_line = req.content.split("\n")[0].strip().replace("#", "").replace("**", "").strip()
+        title = first_line[:60] if first_line else "Ascibasi Tarifi"
+
+    shared = SharedMessage(
+        share_token=token,
+        title=title,
+        content=req.content,
+    )
+    db.add(shared)
+    db.commit()
+
+    share_url = str(request.base_url).rstrip("/") + "/api/shared-message/" + token
+    logger.info("Mesaj paylasim linki olusturuldu: token=%s", token)
+    return {"share_token": token, "share_url": share_url}
+
+
+@app.get("/api/shared-message/{token}", response_class=HTMLResponse)
+@limiter.limit("30/minute")
+async def view_shared_message(request: Request, token: str, db: Session = Depends(get_db)):
+    """Paylasilan mesaji HTML sayfasi olarak goster."""
+    shared = db.query(SharedMessage).filter(SharedMessage.share_token == token).first()
+    if not shared:
+        return HTMLResponse(content="<h1>Icerik bulunamadi</h1><p>Bu paylasim linki gecersiz veya kaldirilmis.</p>", status_code=404)
+
+    import html as html_lib
+    safe_title = html_lib.escape(shared.title or "Ascibasi")
+    html_content = md_lib.markdown(shared.content, extensions=["extra"])
+    page = f"""<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_title} - Ascibasi</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {{ font-family: 'Inter', sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #eee; }}
+        h1 {{ color: #e74c3c; font-size: 24px; margin-bottom: 8px; }}
+        .badge {{ display: inline-block; padding: 4px 12px; background: rgba(192,57,43,0.2); border: 1px solid rgba(192,57,43,0.4); border-radius: 14px; color: #e78b84; font-size: 12px; margin-bottom: 20px; }}
+        .content {{ background: #1e2a4a; padding: 24px; border-radius: 12px; line-height: 1.7; }}
+        .content strong {{ color: #e74c3c; }}
+        .content h1, .content h2, .content h3 {{ margin: 14px 0 6px; }}
+        .content ul, .content ol {{ padding-left: 22px; }}
+        .content p {{ margin-bottom: 8px; }}
+        .footer {{ text-align: center; margin-top: 30px; color: #666; font-size: 13px; }}
+    </style>
+</head>
+<body>
+    <h1>{safe_title}</h1>
+    <div class="badge">Ascibasi - Turk Mutfagi Tarif Asistani</div>
+    <div class="content">{html_content}</div>
+    <div class="footer">Ascibasi ile olusturuldu</div>
+</body>
+</html>"""
+    return HTMLResponse(content=page)

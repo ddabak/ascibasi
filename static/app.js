@@ -6,7 +6,8 @@ function safeMarkdown(text) {
 }
 
 // ========== Auth State ==========
-var authMode = 'login'; // 'login' or 'register'
+var authMode = 'login'; // 'login', 'register', 'verify'
+var pendingVerifyEmail = '';
 var userId = localStorage.getItem('userId');
 var currentUsername = localStorage.getItem('username') || '';
 
@@ -17,26 +18,145 @@ function checkAuth() {
 }
 
 function toggleAuthMode() {
+    var registerFields = document.getElementById('registerFields');
+    var passwordConfirmField = document.getElementById('passwordConfirmField');
+    var verifyCodeField = document.getElementById('verifyCodeField');
+    var resendCodeBtn = document.getElementById('resendCodeBtn');
+    var errorEl = document.getElementById('authError');
+
+    verifyCodeField.style.display = 'none';
+    resendCodeBtn.style.display = 'none';
+    errorEl.style.display = 'none';
+
     if (authMode === 'login') {
         authMode = 'register';
+        registerFields.style.display = 'block';
+        passwordConfirmField.style.display = 'block';
+        document.getElementById('passwordRules').style.display = 'block';
         document.getElementById('authModalTitle').textContent = 'Kayit Ol';
         document.getElementById('authSubmitBtn').textContent = 'Kayit Ol';
         document.getElementById('authSwitchText').textContent = 'Zaten hesabin var mi?';
         document.getElementById('authSwitchBtn').textContent = 'Giris Yap';
     } else {
         authMode = 'login';
+        registerFields.style.display = 'none';
+        passwordConfirmField.style.display = 'none';
         document.getElementById('authModalTitle').textContent = 'Giris Yap';
         document.getElementById('authSubmitBtn').textContent = 'Giris Yap';
         document.getElementById('authSwitchText').textContent = 'Hesabin yok mu?';
         document.getElementById('authSwitchBtn').textContent = 'Kayit Ol';
     }
-    document.getElementById('authError').style.display = 'none';
+}
+
+function updatePasswordRules() {
+    var pw = document.getElementById('authPassword').value;
+    var pw2 = document.getElementById('authPasswordConfirm').value;
+    var check = '\u2705 ';
+    var cross = '\u274C ';
+    document.getElementById('ruleLength').innerHTML = (pw.length >= 8 ? check : cross) + 'En az 8 karakter';
+    document.getElementById('ruleLower').innerHTML = (/[a-z]/.test(pw) ? check : cross) + 'En az bir kucuk harf';
+    document.getElementById('ruleUpper').innerHTML = (/[A-Z]/.test(pw) ? check : cross) + 'En az bir buyuk harf';
+    document.getElementById('ruleDigit').innerHTML = (/[0-9]/.test(pw) ? check : cross) + 'En az bir rakam';
+    document.getElementById('ruleSpecial').innerHTML = (/[!@#$%^&*()_+\-=\[\]{};:'",.<>?\/\\|`~]/.test(pw) ? check : cross) + 'En az bir ozel karakter (!@#$%&*)';
+    document.getElementById('ruleMatch').innerHTML = (pw && pw2 && pw === pw2 ? check : cross) + 'Sifreler eslesiyor';
+}
+
+function maskEmail(email) {
+    var parts = email.split('@');
+    if (parts.length !== 2) return email;
+    var name = parts[0];
+    var domain = parts[1];
+    if (name.length <= 2) return name[0] + '***@' + domain;
+    return name[0] + name[1] + '***@' + domain;
+}
+
+function showVerifyMode(email, firstName, lastName) {
+    authMode = 'verify';
+    pendingVerifyEmail = email;
+    document.getElementById('registerFields').style.display = 'none';
+    document.getElementById('passwordConfirmField').style.display = 'none';
+    document.getElementById('verifyCodeField').style.display = 'block';
+    document.getElementById('resendCodeBtn').style.display = 'inline-block';
+    document.getElementById('authModalTitle').textContent = 'E-posta Dogrulama';
+    document.getElementById('authSubmitBtn').textContent = 'Dogrula';
+    document.getElementById('authSwitchText').textContent = '';
+    document.getElementById('authSwitchBtn').style.display = 'none';
+    document.getElementById('authUsername').parentElement.querySelector('label').style.display = 'none';
+    document.getElementById('authUsername').style.display = 'none';
+    document.getElementById('authPassword').parentElement.querySelector('label').style.display = 'none';
+    document.getElementById('authPassword').style.display = 'none';
+
+    // Kisisel bilgi goster
+    var greeting = '';
+    if (firstName && lastName) {
+        greeting = 'Sayin ' + firstName + ' ' + lastName + ', ';
+    }
+    var maskedEmail = maskEmail(email);
+    document.getElementById('verifyCodeInfo').innerHTML = greeting + 'dogrulama kodu <strong>' + maskedEmail + '</strong> adresine gonderildi.';
+}
+
+function resetAuthForm() {
+    document.getElementById('authUsername').style.display = '';
+    document.getElementById('authPassword').style.display = '';
+    var labels = document.getElementById('authModal').querySelectorAll('label');
+    labels.forEach(function(l) { l.style.display = ''; });
+    document.getElementById('authSwitchBtn').style.display = '';
+    document.getElementById('verifyCodeField').style.display = 'none';
+    document.getElementById('resendCodeBtn').style.display = 'none';
+    document.getElementById('authVerifyCode').value = '';
+    document.getElementById('authFirstName').value = '';
+    document.getElementById('authLastName').value = '';
+    document.getElementById('authBirthDate').value = '';
+    document.getElementById('authEmail').value = '';
+    document.getElementById('authUsername').value = '';
+    document.getElementById('authPassword').value = '';
+    document.getElementById('authPasswordConfirm').value = '';
+    document.getElementById('passwordRules').style.display = 'none';
 }
 
 async function submitAuth() {
+    var errorEl = document.getElementById('authError');
+
+    // E-posta dogrulama modu
+    if (authMode === 'verify') {
+        var code = document.getElementById('authVerifyCode').value.trim();
+        if (!code || code.length !== 6) {
+            errorEl.textContent = '6 haneli dogrulama kodunu girin';
+            errorEl.style.display = 'block';
+            return;
+        }
+        try {
+            var res = await fetch('/api/auth/verify-email', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: pendingVerifyEmail, code: code })
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                errorEl.textContent = data.error || 'Dogrulama hatasi';
+                errorEl.style.display = 'block';
+                return;
+            }
+            userId = data.user_id;
+            currentUsername = data.username;
+            localStorage.setItem('userId', userId);
+            localStorage.setItem('username', currentUsername);
+            document.getElementById('authModal').style.display = 'none';
+            resetAuthForm();
+            authMode = 'login';
+            errorEl.style.display = 'none';
+            showToast('Hesabiniz dogrulandi, hos geldiniz!');
+            updateProfileUI();
+            loadSessions();
+        } catch (e) {
+            errorEl.textContent = 'Baglanti hatasi';
+            errorEl.style.display = 'block';
+        }
+        return;
+    }
+
     var username = document.getElementById('authUsername').value.trim();
     var password = document.getElementById('authPassword').value.trim();
-    var errorEl = document.getElementById('authError');
 
     if (!username || !password) {
         errorEl.textContent = 'Kullanici adi ve sifre gerekli';
@@ -44,51 +164,123 @@ async function submitAuth() {
         return;
     }
 
-    var endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+    if (authMode === 'register') {
+        var firstName = document.getElementById('authFirstName').value.trim();
+        var lastName = document.getElementById('authLastName').value.trim();
+        var birthDate = document.getElementById('authBirthDate').value;
+        var email = document.getElementById('authEmail').value.trim();
+        var passwordConfirm = document.getElementById('authPasswordConfirm').value.trim();
+
+        if (!firstName || !lastName || !email) {
+            errorEl.textContent = 'Tum alanlar zorunludur';
+            errorEl.style.display = 'block';
+            return;
+        }
+        if (password !== passwordConfirm) {
+            errorEl.textContent = 'Sifreler eslesmiyor';
+            errorEl.style.display = 'block';
+            return;
+        }
+
+        try {
+            var res = await fetch('/api/auth/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username: username,
+                    first_name: firstName,
+                    last_name: lastName,
+                    birth_date: birthDate,
+                    email: email,
+                    password: password,
+                    password_confirm: passwordConfirm
+                })
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                errorEl.textContent = data.error || 'Kayit hatasi';
+                errorEl.style.display = 'block';
+                return;
+            }
+            showToast('Dogrulama kodu e-posta adresinize gonderildi');
+            showVerifyMode(email, data.first_name, data.last_name);
+            errorEl.style.display = 'none';
+        } catch (e) {
+            errorEl.textContent = 'Baglanti hatasi';
+            errorEl.style.display = 'block';
+        }
+        return;
+    }
+
+    // Login
     try {
-        var res = await fetch(endpoint, {
+        var res = await fetch('/api/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: username, password: password })
         });
         var data = await res.json();
         if (!res.ok) {
-            errorEl.textContent = data.error || 'Bir hata olustu';
+            if (data.needs_verification) {
+                showToast('Hesabiniz henuz dogrulanmamis');
+                showVerifyMode(data.email, data.first_name, data.last_name);
+                errorEl.style.display = 'none';
+                return;
+            }
+            errorEl.textContent = data.error || 'Giris hatasi';
             errorEl.style.display = 'block';
             return;
         }
-        // Success
         userId = data.user_id;
         currentUsername = data.username;
         localStorage.setItem('userId', userId);
         localStorage.setItem('username', currentUsername);
         document.getElementById('authModal').style.display = 'none';
-        document.getElementById('authUsername').value = '';
-        document.getElementById('authPassword').value = '';
+        resetAuthForm();
         errorEl.style.display = 'none';
-        showToast(authMode === 'login' ? 'Giris basarili!' : 'Kayit basarili!');
+        showToast('Giris basarili!');
         updateProfileUI();
         loadSessions();
     } catch (e) {
-        errorEl.textContent = 'Baglanti hatasi. Lutfen tekrar deneyin.';
+        errorEl.textContent = 'Baglanti hatasi';
         errorEl.style.display = 'block';
     }
 }
 
-// Handle Enter key in auth inputs
+async function resendCode() {
+    if (!pendingVerifyEmail) return;
+    try {
+        var res = await fetch('/api/auth/resend-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: pendingVerifyEmail })
+        });
+        var data = await res.json();
+        if (res.ok) {
+            showToast('Yeni dogrulama kodu gonderildi');
+        } else {
+            showToast(data.error || 'Kod gonderilemedi');
+        }
+    } catch (e) {
+        showToast('Baglanti hatasi');
+    }
+}
+
+// Handle Enter key and password rules in auth inputs
 document.addEventListener('DOMContentLoaded', function() {
-    var authPasswordEl = document.getElementById('authPassword');
-    var authUsernameEl = document.getElementById('authUsername');
-    if (authPasswordEl) {
-        authPasswordEl.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') submitAuth();
-        });
-    }
-    if (authUsernameEl) {
-        authUsernameEl.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') submitAuth();
-        });
-    }
+    var authInputs = ['authPassword', 'authUsername', 'authPasswordConfirm', 'authVerifyCode', 'authEmail'];
+    authInputs.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) {
+            el.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') submitAuth();
+            });
+        }
+    });
+    var pwEl = document.getElementById('authPassword');
+    var pw2El = document.getElementById('authPasswordConfirm');
+    if (pwEl) pwEl.addEventListener('input', updatePasswordRules);
+    if (pw2El) pw2El.addEventListener('input', updatePasswordRules);
 });
 
 // ========== User ID ==========
@@ -793,14 +985,29 @@ async function openProfilePanel() {
         document.getElementById('profileInfoUserId').textContent = data.user_id || '-';
         document.getElementById('profileInfoCreatedAt').textContent = data.created_at ? new Date(data.created_at).toLocaleDateString('tr-TR', {year:'numeric', month:'long', day:'numeric'}) : '-';
         document.getElementById('profileNewUsername').value = data.username || '';
+        document.getElementById('profileFirstName').value = data.first_name || '';
+        document.getElementById('profileLastName').value = data.last_name || '';
+        document.getElementById('profileBirthDate').value = data.birth_date || '';
+        document.getElementById('profileEmail').value = data.email || '';
+
+        // E-posta dogrulama durumu
+        var emailStatus = document.getElementById('profileEmailStatus');
+        if (data.email && data.email_verified) {
+            emailStatus.innerHTML = '<span style="color:#2ecc71;">\u2705 E-posta dogrulanmis</span>';
+        } else if (data.email) {
+            emailStatus.innerHTML = '<span style="color:#e74c3c;">\u274C E-posta dogrulanmamis</span>';
+        } else {
+            emailStatus.innerHTML = '';
+        }
     } catch(e) {}
 
     document.getElementById('profileOldPassword').value = '';
     document.getElementById('profileNewPassword').value = '';
-    var usernameErr = document.getElementById('profileUsernameError');
-    var passwordErr = document.getElementById('profilePasswordError');
-    if (usernameErr) usernameErr.style.display = 'none';
-    if (passwordErr) passwordErr.style.display = 'none';
+    // Hata mesajlarini temizle
+    ['profileUsernameError', 'profilePasswordError', 'profilePersonalError', 'profileEmailError'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
 
     // Close sidebar on mobile
     sidebarEl.classList.remove('open');
@@ -810,6 +1017,73 @@ async function openProfilePanel() {
 function closeProfilePanel() {
     document.getElementById('profilePanel').style.display = 'none';
     document.getElementById('chatContainer').style.display = '';
+}
+
+async function saveProfilePersonal() {
+    var firstName = document.getElementById('profileFirstName').value.trim();
+    var lastName = document.getElementById('profileLastName').value.trim();
+    var birthDate = document.getElementById('profileBirthDate').value;
+    var errEl = document.getElementById('profilePersonalError');
+
+    if (!firstName || !lastName) {
+        errEl.textContent = 'Isim ve soyisim zorunludur';
+        errEl.style.display = 'block';
+        return;
+    }
+    try {
+        var res = await fetch('/api/auth/profile', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, first_name: firstName, last_name: lastName, birth_date: birthDate })
+        });
+        var data = await res.json();
+        if (!res.ok) {
+            errEl.textContent = data.error || 'Bir hata olustu';
+            errEl.style.display = 'block';
+            return;
+        }
+        errEl.style.display = 'none';
+        showToast('Kisisel bilgiler guncellendi!');
+    } catch(e) {
+        errEl.textContent = 'Baglanti hatasi';
+        errEl.style.display = 'block';
+    }
+}
+
+async function saveProfileEmail() {
+    var email = document.getElementById('profileEmail').value.trim();
+    var errEl = document.getElementById('profileEmailError');
+
+    if (!email || !email.includes('@')) {
+        errEl.textContent = 'Gecerli bir e-posta adresi girin';
+        errEl.style.display = 'block';
+        return;
+    }
+    try {
+        var res = await fetch('/api/auth/profile', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, email: email })
+        });
+        var data = await res.json();
+        if (!res.ok) {
+            errEl.textContent = data.error || 'Bir hata olustu';
+            errEl.style.display = 'block';
+            return;
+        }
+        errEl.style.display = 'none';
+        var emailStatus = document.getElementById('profileEmailStatus');
+        if (data.email_verified) {
+            emailStatus.innerHTML = '<span style="color:#2ecc71;">\u2705 E-posta dogrulanmis</span>';
+            showToast('E-posta guncellendi!');
+        } else {
+            emailStatus.innerHTML = '<span style="color:#e67e22;">\u2709 Dogrulama kodu gonderildi</span>';
+            showToast('Yeni e-posta adresine dogrulama kodu gonderildi');
+        }
+    } catch(e) {
+        errEl.textContent = 'Baglanti hatasi';
+        errEl.style.display = 'block';
+    }
 }
 
 async function saveProfileUsername() {
@@ -1218,6 +1492,64 @@ function createFavBtn(text) {
     return btn;
 }
 
+// ========== Mesaj Duzenle Butonu ==========
+function createEditBtn(msgElement, text) {
+    var btn = document.createElement('button');
+    btn.className = 'edit-btn';
+    btn.textContent = '\u270F\uFE0F';
+    btn.title = 'Duzenle';
+    btn.onclick = function() {
+        // Bu mesajdan sonraki tum mesajlari bul
+        var allMsgs = messagesEl.querySelectorAll('.message');
+        var found = false;
+        var toRemove = [];
+        for (var i = 0; i < allMsgs.length; i++) {
+            if (allMsgs[i] === msgElement) found = true;
+            if (found) toRemove.push(allMsgs[i]);
+        }
+        // DOM'dan kaldir
+        toRemove.forEach(function(el) { el.remove(); });
+        // Veritabanindan sil
+        if (sessionId && toRemove.length > 0) {
+            fetch('/api/sessions/' + sessionId + '/rewind?count=' + toRemove.length, { method: 'DELETE' });
+        }
+        // Metni input'a koy
+        inputEl.value = text;
+        inputEl.focus();
+    };
+    return btn;
+}
+
+// ========== Paylas Butonu ==========
+function createShareBtn(text) {
+    var btn = document.createElement('button');
+    btn.className = 'share-btn';
+    btn.textContent = '\uD83D\uDD17';
+    btn.title = 'Paylas';
+    btn.onclick = async function() {
+        try {
+            var res = await fetch('/api/messages/share', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: text })
+            });
+            var data = await res.json();
+            if (res.ok && data.share_url) {
+                navigator.clipboard.writeText(data.share_url).then(function() {
+                    showToast('Paylasim linki kopyalandi!');
+                }).catch(function() {
+                    prompt('Paylasim linki:', data.share_url);
+                });
+            } else {
+                showToast('Paylasim linki olusturulamadi');
+            }
+        } catch(e) {
+            showToast('Baglanti hatasi');
+        }
+    };
+    return btn;
+}
+
 // ========== "Daha Detayli Anlat" Butonu ==========
 function createDetailBtn(text) {
     var btn = document.createElement('button');
@@ -1245,6 +1577,79 @@ function createPortionBtn(text) {
         }
     };
     return btn;
+}
+
+// ========== Tarif Yaniti mi Kontrol ==========
+function isRecipeResponse(text) {
+    var lower = text.toLowerCase();
+    // Menu, oneri, liste gibi yanitlari disla
+    var nonRecipePatterns = ['pazartesi', 'sali', 'çarşamba', 'carsamba', 'perşembe',
+        'persembe', 'cuma', 'cumartesi', 'pazar', 'haftalik', 'haftalık',
+        'menu', 'menü', 'gun ', 'gün '];
+    var nonRecipeCount = 0;
+    for (var i = 0; i < nonRecipePatterns.length; i++) {
+        if (lower.includes(nonRecipePatterns[i])) nonRecipeCount++;
+    }
+    // 3+ gun ismi geciyorsa bu bir menu/liste yaniti
+    if (nonRecipeCount >= 3) return false;
+
+    // Tek bir tarifin detayli anlatimi mi kontrol et
+    var recipeKeywords = ['malzeme', 'yapılış', 'yapilis', 'pişirme', 'pisirme',
+        'püf nokta', 'puf nokta', 'hazırlık', 'hazirlik',
+        'yemek kaşığı', 'yemek kasigi', 'su bardağı', 'su bardagi',
+        'çay kaşığı', 'cay kasigi', 'dakika ', 'derecede',
+        'fırınla', 'firinla', 'kavur', 'haşla', 'hasla', 'doğra', 'dogra'];
+    var matchCount = 0;
+    for (var i = 0; i < recipeKeywords.length; i++) {
+        if (lower.includes(recipeKeywords[i])) matchCount++;
+    }
+    return matchCount >= 3;
+}
+
+// ========== Mesaj Limiti ==========
+async function updateMessageLimit() {
+    if (!userId) return;
+    try {
+        var res = await fetch('/api/chat/limit?user_id=' + userId);
+        var data = await res.json();
+        var bar = document.getElementById('messageLimitBar');
+        var text = document.getElementById('messageLimitText');
+        var remaining = data.remaining;
+
+        bar.classList.add('visible');
+        bar.classList.remove('warning', 'exhausted');
+
+        var mins = data.minutes_until_next;
+        var timeText = '';
+        if (mins) {
+            if (mins >= 60) {
+                var h = Math.floor(mins / 60);
+                var m = mins % 60;
+                timeText = h + ' sa ' + (m > 0 ? m + ' dk' : '');
+            } else {
+                timeText = mins + ' dk';
+            }
+        }
+
+        if (remaining <= 0) {
+            text.textContent = 'Mesaj hakkiniz doldu. Sonraki hak: ' + timeText + ' sonra';
+            bar.classList.add('exhausted');
+            inputEl.disabled = true;
+            sendBtn.disabled = true;
+            inputEl.placeholder = 'Mesaj limitiniz doldu...';
+        } else if (remaining < 20 && timeText) {
+            text.textContent = 'Kalan: ' + remaining + '/20 \u00B7 Sonraki yenilenme: ' + timeText;
+            if (remaining <= 5) bar.classList.add('warning');
+            inputEl.disabled = false;
+            sendBtn.disabled = false;
+            inputEl.placeholder = 'Bir yemek tarifi sorun...';
+        } else {
+            text.textContent = 'Kalan mesaj hakki: ' + remaining + '/20';
+            inputEl.disabled = false;
+            sendBtn.disabled = false;
+            inputEl.placeholder = 'Bir yemek tarifi sorun...';
+        }
+    } catch(e) {}
 }
 
 // ========== Streaming Mesaj Gonder ==========
@@ -1275,6 +1680,19 @@ async function sendMessage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: message, session_id: sessionId, user_id: userId })
         });
+
+        // Limit asildiysa
+        if (res.status === 429) {
+            typingEl.classList.remove('active');
+            var errData = await res.json();
+            contentDiv.textContent = errData.error || 'Mesaj limitiniz doldu.';
+            contentDiv.style.color = '#e74c3c';
+            messagesEl.insertBefore(assistantDiv, typingEl);
+            updateMessageLimit();
+            sendBtn.disabled = false;
+            return;
+        }
+
         typingEl.classList.remove('active');
         messagesEl.insertBefore(assistantDiv, typingEl);
 
@@ -1303,27 +1721,30 @@ async function sendMessage() {
                         var btnWrap = document.createElement('div');
                         btnWrap.className = 'msg-actions';
                         btnWrap.appendChild(createCopyBtn(fullText));
+                        btnWrap.appendChild(createShareBtn(fullText));
                         btnWrap.appendChild(createFavBtn(fullText));
                         assistantDiv.appendChild(btnWrap);
 
-                        // Extra action buttons row (detail, portion)
-                        var extraWrap = document.createElement('div');
-                        extraWrap.className = 'msg-extra-actions';
-                        extraWrap.appendChild(createDetailBtn(fullText));
-                        extraWrap.appendChild(createPortionBtn(fullText));
-                        assistantDiv.appendChild(extraWrap);
+                        // Extra action buttons + referanslar sadece tarif yanitlarinda
+                        if (isRecipeResponse(fullText)) {
+                            var extraWrap = document.createElement('div');
+                            extraWrap.className = 'msg-extra-actions';
+                            extraWrap.appendChild(createDetailBtn(fullText));
+                            extraWrap.appendChild(createPortionBtn(fullText));
+                            assistantDiv.appendChild(extraWrap);
 
-                        if (references.length > 0) {
-                            var refDiv = document.createElement('div');
-                            refDiv.className = 'references';
-                            refDiv.innerHTML = '<span class="ref-title">Kaynak Siteler:</span>';
-                            references.forEach(function(url) {
-                                var a = document.createElement('a');
-                                a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-                                try { a.textContent = new URL(url).hostname.replace('www.', ''); } catch(e) { a.textContent = url; }
-                                refDiv.appendChild(a);
-                            });
-                            assistantDiv.appendChild(refDiv);
+                            if (references.length > 0) {
+                                var refDiv = document.createElement('div');
+                                refDiv.className = 'references';
+                                refDiv.innerHTML = '<span class="ref-title">Kaynak Siteler:</span>';
+                                references.forEach(function(url) {
+                                    var a = document.createElement('a');
+                                    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+                                    try { a.textContent = new URL(url).hostname.replace('www.', ''); } catch(e) { a.textContent = url; }
+                                    refDiv.appendChild(a);
+                                });
+                                assistantDiv.appendChild(refDiv);
+                            }
                         }
                         // Cache badge indicator
                         if (data.cached) {
@@ -1334,6 +1755,7 @@ async function sendMessage() {
                         }
 
                         loadSessions();
+                        updateMessageLimit();
                     }
                 } catch(e) {}
             }
@@ -1357,6 +1779,7 @@ function addMessage(text, role, references, isHistory) {
         var btnWrap = document.createElement('div');
         btnWrap.className = 'msg-actions';
         btnWrap.appendChild(createCopyBtn(text));
+        btnWrap.appendChild(createShareBtn(text));
         btnWrap.appendChild(createFavBtn(text));
         div.appendChild(btnWrap);
 
@@ -1366,7 +1789,13 @@ function addMessage(text, role, references, isHistory) {
         extraWrap.appendChild(createDetailBtn(text));
         extraWrap.appendChild(createPortionBtn(text));
         div.appendChild(extraWrap);
-    } else { div.textContent = text; }
+    } else {
+        var userContent = document.createElement('span');
+        userContent.textContent = text;
+        div.appendChild(userContent);
+        var editBtn = createEditBtn(div, text);
+        div.appendChild(editBtn);
+    }
     messagesEl.insertBefore(div, typingEl);
     if (!isHistory) scrollToBottom();
 }
@@ -1600,3 +2029,4 @@ checkAuth();
 loadSessions();
 loadTrashCount();
 renderSuggestions();
+updateMessageLimit();

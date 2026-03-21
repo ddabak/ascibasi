@@ -26,13 +26,54 @@
             </div>
             <div class="modal-body">
                 <div id="authError" class="auth-error" style="display:none;"></div>
+
+                <!-- Kayit formu ek alanlari -->
+                <div id="registerFields" style="display:none;">
+                    <div style="display:flex;gap:8px;">
+                        <div style="flex:1;">
+                            <label>Isim</label>
+                            <input type="text" id="authFirstName" placeholder="Isim..." autocomplete="given-name">
+                        </div>
+                        <div style="flex:1;">
+                            <label>Soyisim</label>
+                            <input type="text" id="authLastName" placeholder="Soyisim..." autocomplete="family-name">
+                        </div>
+                    </div>
+                    <label>Dogum Tarihi</label>
+                    <input type="date" id="authBirthDate" autocomplete="bday">
+                    <label>E-posta</label>
+                    <input type="email" id="authEmail" placeholder="ornek@mail.com" autocomplete="email">
+                </div>
+
                 <label>Kullanici Adi</label>
                 <input type="text" id="authUsername" placeholder="Kullanici adi..." autocomplete="username">
                 <label>Sifre</label>
                 <input type="password" id="authPassword" placeholder="Sifre..." autocomplete="current-password">
+
+                <!-- Sifre tekrar (sadece kayit) -->
+                <div id="passwordConfirmField" style="display:none;">
+                    <label>Sifre Tekrar</label>
+                    <input type="password" id="authPasswordConfirm" placeholder="Sifreyi tekrar girin..." autocomplete="new-password">
+                    <div class="password-rules" id="passwordRules" style="display:none;font-size:11px;color:var(--text-secondary);margin-top:6px;line-height:1.6;">
+                        <div id="ruleLength">&#10060; En az 8 karakter</div>
+                        <div id="ruleLower">&#10060; En az bir kucuk harf</div>
+                        <div id="ruleUpper">&#10060; En az bir buyuk harf</div>
+                        <div id="ruleDigit">&#10060; En az bir rakam</div>
+                        <div id="ruleSpecial">&#10060; En az bir ozel karakter (!@#$%&*)</div>
+                        <div id="ruleMatch">&#10060; Sifreler eslesiyor</div>
+                    </div>
+                </div>
+
+                <!-- Dogrulama kodu (kayit sonrasi) -->
+                <div id="verifyCodeField" style="display:none;">
+                    <div id="verifyCodeInfo" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.5;"></div>
+                    <label>Dogrulama Kodu</label>
+                    <input type="text" id="authVerifyCode" placeholder="6 haneli kodu girin..." maxlength="6" autocomplete="one-time-code">
+                </div>
             </div>
             <div class="modal-footer auth-modal-footer">
                 <button class="modal-save" id="authSubmitBtn" onclick="submitAuth()">Giris Yap</button>
+                <button class="modal-save" id="resendCodeBtn" onclick="resendCode()" style="display:none;background:#555;">Kodu Tekrar Gonder</button>
             </div>
             <div class="auth-switch">
                 <span id="authSwitchText">Hesabin yok mu?</span>
@@ -162,9 +203,14 @@
 
             <button class="scroll-bottom-btn" id="scrollBottomBtn" onclick="scrollToBottom()">&darr;</button>
 
-            <div class="chat-input">
-                <input type="text" id="messageInput" placeholder="Bir yemek tarifi sorun..." autocomplete="off">
-                <button id="sendBtn" onclick="sendMessage()">&#10148;</button>
+            <div class="chat-input-wrapper">
+                <div class="message-limit-bar" id="messageLimitBar">
+                    <span id="messageLimitText"></span>
+                </div>
+                <div class="chat-input">
+                    <input type="text" id="messageInput" placeholder="Bir yemek tarifi sorun..." autocomplete="off">
+                    <button id="sendBtn" onclick="sendMessage()">&#10148;</button>
+                </div>
             </div>
         </div>
 
@@ -194,6 +240,37 @@
                         <span class="profile-info-label">Kayit Tarihi</span>
                         <span class="profile-info-value" id="profileInfoCreatedAt">-</span>
                     </div>
+                </div>
+
+                <div class="profile-settings-section">
+                    <h3 class="profile-section-title">Kisisel Bilgiler</h3>
+                    <div style="display:flex;gap:8px;">
+                        <div style="flex:1;">
+                            <label class="profile-field-label">Isim</label>
+                            <input type="text" id="profileFirstName" class="profile-input" placeholder="Isim...">
+                        </div>
+                        <div style="flex:1;">
+                            <label class="profile-field-label">Soyisim</label>
+                            <input type="text" id="profileLastName" class="profile-input" placeholder="Soyisim...">
+                        </div>
+                    </div>
+                    <label class="profile-field-label" style="margin-top:8px;">Dogum Tarihi</label>
+                    <input type="date" id="profileBirthDate" class="profile-input">
+                    <div class="profile-form-row" style="margin-top:8px;">
+                        <div></div>
+                        <button class="profile-save-btn" onclick="saveProfilePersonal()">Kaydet</button>
+                    </div>
+                    <div id="profilePersonalError" class="profile-error" style="display:none;"></div>
+                </div>
+
+                <div class="profile-settings-section">
+                    <h3 class="profile-section-title">E-posta Adresi</h3>
+                    <div class="profile-form-row">
+                        <input type="email" id="profileEmail" class="profile-input" placeholder="E-posta adresi...">
+                        <button class="profile-save-btn" onclick="saveProfileEmail()">Kaydet</button>
+                    </div>
+                    <div id="profileEmailStatus" style="font-size:11px;margin-top:4px;"></div>
+                    <div id="profileEmailError" class="profile-error" style="display:none;"></div>
                 </div>
 
                 <div class="profile-settings-section">

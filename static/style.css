@@ -430,12 +430,19 @@ body {
 }
 .message.assistant:hover .msg-actions { opacity: 0.7; }
 .msg-actions:hover { opacity: 1 !important; }
-.fav-btn, .copy-btn {
+.edit-btn {
+    background: none; border: 1px solid transparent; border-radius: 8px;
+    cursor: pointer; font-size: 12px; padding: 2px 6px; line-height: 1;
+    transition: all 0.15s; opacity: 0; margin-left: 8px;
+}
+.message.user:hover .edit-btn { opacity: 0.6; }
+.edit-btn:hover { opacity: 1 !important; background: var(--copy-bg-hover); border-color: var(--border-subtle); }
+.fav-btn, .copy-btn, .share-btn {
     background: none; border: 1px solid transparent; border-radius: 8px;
     cursor: pointer; font-size: 13px; padding: 4px 6px; line-height: 1;
     transition: all 0.15s; position: static; opacity: 1;
 }
-.fav-btn:hover, .copy-btn:hover {
+.fav-btn:hover, .copy-btn:hover, .share-btn:hover {
     background: var(--copy-bg-hover);
     border-color: var(--border-subtle);
     transform: scale(1.1);
@@ -536,12 +543,22 @@ body {
 }
 
 /* ========== Chat Input ========== */
+.chat-input-wrapper {
+    background: var(--bg-input-area);
+    border-top: 1px solid var(--border-subtle);
+}
+.message-limit-bar {
+    text-align: center; font-size: 11px; padding: 4px 0;
+    color: var(--text-secondary); display: none;
+}
+.message-limit-bar.visible { display: block; }
+.message-limit-bar.warning { color: #e67e22; }
+.message-limit-bar.exhausted { color: #e74c3c; font-weight: 600; }
 .chat-input {
     display: flex;
     padding: 14px 18px;
     gap: 10px;
-    background: var(--bg-input-area);
-    border-top: 1px solid var(--border-subtle);
+    background: transparent;
     transition: background 0.4s;
     align-items: center;
 }
@@ -1032,14 +1049,23 @@ body {
 
 /* ========== Malzeme Butonu & Modal ========== */
 .ingredient-btn {
-    background: linear-gradient(135deg, var(--accent-gold), var(--accent-warm)) !important;
-    border-color: transparent !important;
-    color: #fff !important;
-    font-weight: 600 !important;
+    padding: 9px 18px;
+    border: 1.5px solid var(--accent-gold);
+    border-radius: 24px;
+    background: transparent;
+    color: var(--accent-gold);
+    font-size: 13px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.25s ease;
 }
 .ingredient-btn:hover {
-    box-shadow: 0 3px 14px rgba(212, 168, 83, 0.35) !important;
+    background: linear-gradient(135deg, var(--accent-gold), var(--accent-warm));
+    border-color: transparent;
+    color: #fff;
     transform: translateY(-1px);
+    box-shadow: 0 3px 14px rgba(212, 168, 83, 0.35);
 }
 .ingredient-textarea {
     width: 100%;

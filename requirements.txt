@@ -9,3 +9,4 @@ httpx==0.28.1
 fpdf2==2.8.4
 markdown==3.9
 slowapi==0.1.9
+resend==2.7.0

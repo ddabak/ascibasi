@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, text as sa_text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, text as sa_text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -77,7 +77,14 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(100), unique=True, index=True)
     username = Column(String(100), nullable=False)
+    first_name = Column(String(100), nullable=True)
+    last_name = Column(String(100), nullable=True)
+    birth_date = Column(String(20), nullable=True)
+    email = Column(String(200), nullable=True, index=True)
     password_hash = Column(String(256), nullable=False)
+    email_verified = Column(Boolean, default=False)
+    verification_code = Column(String(10), nullable=True)
+    verification_code_expires = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -103,6 +110,15 @@ class RecipeCache(Base):
     query_key = Column(String(200), unique=True, index=True)
     response = Column(Text)
     references_json = Column(Text, nullable=True)  # JSON string of reference URLs
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SharedMessage(Base):
+    __tablename__ = "shared_messages"
+    id = Column(Integer, primary_key=True)
+    share_token = Column(String(100), unique=True, index=True)
+    title = Column(String(300), nullable=True)
+    content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -195,6 +211,26 @@ def init_db():
                     conn.commit()
             except Exception:
                 pass
+
+    # Add new columns to users if missing
+    if "users" in existing:
+        columns = [col["name"] for col in inspector.get_columns("users")]
+        for col_name, col_def in [
+            ("first_name", "VARCHAR(100)"),
+            ("last_name", "VARCHAR(100)"),
+            ("birth_date", "VARCHAR(20)"),
+            ("email", "VARCHAR(200)"),
+            ("email_verified", "BOOLEAN DEFAULT FALSE"),
+            ("verification_code", "VARCHAR(10)"),
+            ("verification_code_expires", "TIMESTAMP"),
+        ]:
+            if col_name not in columns:
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(sa_text(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}"))
+                        conn.commit()
+                except Exception:
+                    pass
 
     # Add folder_id to session_meta if missing (Feature: Chat Folders)
     if "session_meta" in existing:
