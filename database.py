@@ -88,6 +88,15 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class SessionToken(Base):
+    __tablename__ = "session_tokens"
+    id = Column(Integer, primary_key=True)
+    token = Column(String(256), unique=True, index=True, nullable=False)
+    user_id = Column(String(100), index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+
+
 class SessionMeta(Base):
     __tablename__ = "session_meta"
     id = Column(Integer, primary_key=True)

@@ -13,7 +13,7 @@ from typing import Optional, List
 import httpx
 import markdown as md_lib
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -30,7 +30,7 @@ from database import (
     init_db, get_db, Recipe, ChatHistory,
     RecipeBook, BookFolder, SavedRecipe, User,
     SessionMeta, RecipeCache, ShoppingList, ChatFolder,
-    SharedMessage,
+    SharedMessage, SessionToken,
 )
 
 load_dotenv()
@@ -53,10 +53,29 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 import resend
+from authlib.integrations.starlette_client import OAuth
+from starlette.middleware.sessions import SessionMiddleware
+
+# Session middleware (Google OAuth icin gerekli)
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("PASSWORD_SALT", "ascibasi_default_salt_2026"))
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
 resend.api_key = os.getenv("RESEND_API_KEY", "")
+
+# Google OAuth yapilandirmasi
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+oauth = OAuth()
+if GOOGLE_CLIENT_ID:
+    oauth.register(
+        name='google',
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={'scope': 'openid email profile'},
+    )
 
 
 async def search_references(food_name: str) -> List[str]:
@@ -176,7 +195,6 @@ Kullanicinin mesajini analiz et:
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
-    user_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -374,25 +392,37 @@ def generate_verification_code() -> str:
     return str(random.randint(100000, 999999))
 
 
-def send_verification_email(email: str, code: str, username: str) -> bool:
-    """Resend ile dogrulama maili gonder."""
+def send_code_email(email: str, code: str, username: str, purpose: str = "verify") -> bool:
+    """Resend ile kod maili gonder. purpose: verify, login, reset"""
     if not resend.api_key:
         logger.error("RESEND_API_KEY ayarlanmamis")
         return False
+
+    subjects = {
+        "verify": "Ascibasi - E-posta Dogrulama Kodunuz",
+        "login": "Ascibasi - Giris Onay Kodunuz",
+        "reset": "Ascibasi - Sifre Sifirlama Kodunuz",
+    }
+    messages = {
+        "verify": "Hesabinizi dogrulamak icin asagidaki kodu kullanin:",
+        "login": "Hesabiniza giris yapmak icin asagidaki onay kodunu girin:",
+        "reset": "Sifrenizi sifirlamak icin asagidaki kodu kullanin:",
+    }
+
     try:
         resend.Emails.send({
             "from": "Ascibasi <onboarding@resend.dev>",
             "to": [email],
-            "subject": "Ascibasi - E-posta Dogrulama Kodunuz",
+            "subject": subjects.get(purpose, subjects["verify"]),
             "html": f"""
             <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;
                         padding: 30px; background: #1a1a2e; color: #eee; border-radius: 12px;">
-                <h2 style="color: #e74c3c; text-align: center;">Ascibasi</h2>
+                <h2 style="color: #10b981; text-align: center;">Ascibasi</h2>
                 <p>Merhaba <strong>{username}</strong>,</p>
-                <p>Hesabinizi dogrulamak icin asagidaki kodu kullanin:</p>
+                <p>{messages.get(purpose, messages["verify"])}</p>
                 <div style="text-align: center; margin: 25px 0;">
                     <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px;
-                                 color: #e74c3c; background: #1e2a4a; padding: 15px 30px;
+                                 color: #10b981; background: #1e2a4a; padding: 15px 30px;
                                  border-radius: 8px; display: inline-block;">{code}</span>
                 </div>
                 <p style="color: #999; font-size: 13px;">Bu kod 10 dakika gecerlidir.</p>
@@ -400,11 +430,16 @@ def send_verification_email(email: str, code: str, username: str) -> bool:
             </div>
             """,
         })
-        logger.info("Dogrulama maili gonderildi: %s", email)
+        logger.info("%s maili gonderildi: %s", purpose, email)
         return True
     except Exception as e:
         logger.error("Mail gonderim hatasi: %s", str(e))
         return False
+
+
+# Geriye uyumluluk
+def send_verification_email(email: str, code: str, username: str) -> bool:
+    return send_code_email(email, code, username, "verify")
 
 def hash_password(password: str) -> str:
     """SHA-256 password hashing with salt."""
@@ -431,6 +466,56 @@ def verify_password(password: str, stored_hash: str, db: Session = None, user: o
     return False
 
 
+# ========== Session Token Yardimcilari ==========
+
+SESSION_TOKEN_EXPIRY_DAYS = 7
+
+
+def create_session_token(db: Session, user_id: str) -> str:
+    """Yeni oturum token'i olustur ve veritabanina kaydet."""
+    token = secrets.token_urlsafe(32)
+    session_token = SessionToken(
+        token=token,
+        user_id=user_id,
+        expires_at=datetime.utcnow() + timedelta(days=SESSION_TOKEN_EXPIRY_DAYS),
+    )
+    db.add(session_token)
+    # Suresi dolmus eski tokenlari temizle
+    db.query(SessionToken).filter(SessionToken.expires_at < datetime.utcnow()).delete()
+    db.commit()
+    return token
+
+
+def delete_session_token(db: Session, token: str):
+    """Tek bir token'i sil (cikis yapma)."""
+    db.query(SessionToken).filter(SessionToken.token == token).delete()
+    db.commit()
+
+
+def delete_all_user_tokens(db: Session, user_id: str):
+    """Kullanicinin tum tokenlarini sil (sifre degisikliginde)."""
+    db.query(SessionToken).filter(SessionToken.user_id == user_id).delete()
+    db.commit()
+
+
+async def get_current_user_id(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> str:
+    """Her istekte token'i kontrol eden guvenlik fonksiyonu."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Oturum gecersiz. Lutfen giris yapin.")
+    token = authorization[7:]
+    session_token = db.query(SessionToken).filter(SessionToken.token == token).first()
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Oturum gecersiz. Lutfen giris yapin.")
+    if session_token.expires_at < datetime.utcnow():
+        db.delete(session_token)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Oturumunuzun suresi dolmus. Lutfen tekrar giris yapin.")
+    return session_token.user_id
+
+
 @app.on_event("startup")
 def startup():
     logger.info("Ascibasi uygulamasi baslatiliyor...")
@@ -439,7 +524,7 @@ def startup():
 
 
 @app.get("/", response_class=HTMLResponse)
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
@@ -447,7 +532,7 @@ async def home(request: Request):
 # ========== Health Check ==========
 
 @app.get("/api/health")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def health_check(request: Request, db: Session = Depends(get_db)):
     """Veritabani baglantisini kontrol et ve durum bilgisi don."""
     try:
@@ -484,13 +569,28 @@ class ResendCodeRequest(BaseModel):
     email: str
 
 
+class LoginVerifyRequest(BaseModel):
+    email: str
+    code: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+    new_password_confirm: str
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 
 class ProfileUpdateRequest(BaseModel):
-    user_id: str
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -499,7 +599,6 @@ class ProfileUpdateRequest(BaseModel):
 
 
 class PasswordChangeRequest(BaseModel):
-    user_id: str
     old_password: str
     new_password: str
 
@@ -586,8 +685,9 @@ async def verify_email(request: Request, req: VerifyEmailRequest, db: Session = 
     user.verification_code = None
     user.verification_code_expires = None
     db.commit()
+    token = create_session_token(db, user.user_id)
     logger.info("E-posta dogrulandi: %s (%s)", user.username, req.email)
-    return {"user_id": user.user_id, "username": user.username, "message": "E-posta basariyla dogrulandi"}
+    return {"token": token, "user_id": user.user_id, "username": user.username, "message": "E-posta basariyla dogrulandi"}
 
 
 @app.post("/api/auth/resend-code")
@@ -613,28 +713,209 @@ async def resend_verification_code(request: Request, req: ResendCodeRequest, db:
 @app.post("/api/auth/login")
 @limiter.limit("10/minute")
 async def login(request: Request, req: LoginRequest, db: Session = Depends(get_db)):
-    """Kullanici girisi."""
+    """Kullanici girisi - sifre dogruysa e-postaya onay kodu gonderir."""
     if not req.username or not req.password:
         return Response(content=json.dumps({"error": "Kullanici adi ve sifre gerekli"}), status_code=400, media_type="application/json")
 
-    user = db.query(User).filter(User.username == req.username).first()
+    # Kullanici adi veya e-posta ile giris
+    user = db.query(User).filter(
+        or_(User.username == req.username, User.email == req.username)
+    ).first()
     if not user or not verify_password(req.password, user.password_hash, db, user):
-        return Response(content=json.dumps({"error": "Kullanici adi veya sifre hatali"}), status_code=401, media_type="application/json")
+        return Response(content=json.dumps({"error": "Kullanici adi/e-posta veya sifre hatali"}), status_code=401, media_type="application/json")
 
     if not user.email_verified:
         return Response(content=json.dumps({"error": "E-posta adresiniz henuz dogrulanmamis", "needs_verification": True, "email": user.email, "first_name": user.first_name or "", "last_name": user.last_name or ""}), status_code=403, media_type="application/json")
 
-    logger.info("Kullanici giris yapti: %s", req.username)
-    return {"user_id": user.user_id, "username": user.username}
+    # 2FA: Onay kodu gonder
+    code = generate_verification_code()
+    user.verification_code = code
+    user.verification_code_expires = datetime.utcnow() + timedelta(minutes=10)
+    db.commit()
+
+    send_code_email(user.email, code, user.username, "login")
+    logger.info("Giris onay kodu gonderildi: %s", user.username)
+    return {
+        "needs_login_code": True,
+        "email": user.email,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "message": "Onay kodu e-posta adresinize gonderildi",
+    }
+
+
+@app.post("/api/auth/login-verify")
+@limiter.limit("10/minute")
+async def login_verify(request: Request, req: LoginVerifyRequest, db: Session = Depends(get_db)):
+    """Giris onay kodunu dogrula ve token olustur."""
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        return Response(content=json.dumps({"error": "Kullanici bulunamadi"}), status_code=404, media_type="application/json")
+
+    if not user.verification_code or user.verification_code != req.code:
+        return Response(content=json.dumps({"error": "Onay kodu hatali"}), status_code=400, media_type="application/json")
+
+    if user.verification_code_expires and datetime.utcnow() > user.verification_code_expires:
+        return Response(content=json.dumps({"error": "Onay kodunun suresi dolmus. Tekrar giris yapin."}), status_code=400, media_type="application/json")
+
+    user.verification_code = None
+    user.verification_code_expires = None
+    db.commit()
+
+    token = create_session_token(db, user.user_id)
+    logger.info("Kullanici giris yapti (2FA): %s", user.username)
+    return {"token": token, "user_id": user.user_id, "username": user.username}
+
+
+@app.post("/api/auth/forgot-password")
+@limiter.limit("5/minute")
+async def forgot_password(request: Request, req: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Sifre sifirlama kodu gonder."""
+    user = db.query(User).filter(User.email == req.email, User.email_verified == True).first()
+    if not user:
+        # Guvenlik icin kullanici yoksa bile ayni mesaji don
+        return {"message": "E-posta adresi kayitliysa sifirlama kodu gonderildi"}
+
+    code = generate_verification_code()
+    user.verification_code = code
+    user.verification_code_expires = datetime.utcnow() + timedelta(minutes=10)
+    db.commit()
+
+    send_code_email(user.email, code, user.username, "reset")
+    logger.info("Sifre sifirlama kodu gonderildi: %s", user.email)
+    return {"message": "E-posta adresi kayitliysa sifirlama kodu gonderildi"}
+
+
+@app.post("/api/auth/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(request: Request, req: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Sifre sifirlama kodunu dogrula ve yeni sifre belirle."""
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        return Response(content=json.dumps({"error": "Kullanici bulunamadi"}), status_code=404, media_type="application/json")
+
+    if not user.verification_code or user.verification_code != req.code:
+        return Response(content=json.dumps({"error": "Sifirlama kodu hatali"}), status_code=400, media_type="application/json")
+
+    if user.verification_code_expires and datetime.utcnow() > user.verification_code_expires:
+        return Response(content=json.dumps({"error": "Kodun suresi dolmus. Tekrar isteyin."}), status_code=400, media_type="application/json")
+
+    if req.new_password != req.new_password_confirm:
+        return Response(content=json.dumps({"error": "Sifreler eslesmiyor"}), status_code=400, media_type="application/json")
+
+    pw_error = validate_password(req.new_password)
+    if pw_error:
+        return Response(content=json.dumps({"error": pw_error}), status_code=400, media_type="application/json")
+
+    user.password_hash = hash_password(req.new_password)
+    user.verification_code = None
+    user.verification_code_expires = None
+    db.commit()
+
+    delete_all_user_tokens(db, user.user_id)
+    logger.info("Sifre sifirlandi: %s", user.email)
+    return {"message": "Sifreniz basariyla degistirildi. Giris yapabilirsiniz."}
+
+
+@app.post("/api/auth/logout")
+@limiter.limit("120/minute")
+async def logout(request: Request, authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Kullanici cikisi - token'i sil."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"ok": True}
+    token = authorization[7:]
+    delete_session_token(db, token)
+    logger.info("Kullanici cikis yapti")
+    return {"ok": True}
+
+
+# ========== Google OAuth ==========
+
+@app.get("/api/auth/google/login")
+async def google_login(request: Request):
+    """Google ile giris baslat."""
+    if not GOOGLE_CLIENT_ID:
+        return Response(content=json.dumps({"error": "Google giris yapilandirmasi eksik"}), status_code=500, media_type="application/json")
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/auth/google/callback"
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/api/auth/google/callback")
+async def google_callback(request: Request, db: Session = Depends(get_db)):
+    """Google OAuth callback - kullaniciyi olustur veya giris yap."""
+    try:
+        token_data = await oauth.google.authorize_access_token(request)
+        user_info = token_data.get('userinfo')
+        if not user_info:
+            return HTMLResponse(content="<script>window.opener.postMessage({error:'Google bilgileri alinamadi'},'*');window.close();</script>")
+
+        google_email = user_info.get('email', '')
+        google_name = user_info.get('given_name', '')
+        google_surname = user_info.get('family_name', '')
+
+        if not google_email:
+            return HTMLResponse(content="<script>window.opener.postMessage({error:'Google hesabindan e-posta alinamadi'},'*');window.close();</script>")
+
+        # Mevcut kullaniciyi e-posta ile ara
+        user = db.query(User).filter(User.email == google_email, User.email_verified == True).first()
+
+        if not user:
+            # Yeni kullanici olustur (sifresiz, Google ile giris)
+            user_id = str(uuid.uuid4())
+            username = google_email.split('@')[0]
+            # Kullanici adi benzersiz olmali
+            existing = db.query(User).filter(User.username == username).first()
+            if existing:
+                username = username + str(random.randint(100, 999))
+            user = User(
+                user_id=user_id,
+                username=username,
+                first_name=google_name,
+                last_name=google_surname,
+                email=google_email,
+                password_hash="GOOGLE_OAUTH",
+                email_verified=True,
+            )
+            db.add(user)
+            db.commit()
+            logger.info("Google ile yeni kullanici olusturuldu: %s", google_email)
+        else:
+            # Mevcut kullanici - isim guncelle (Google'dan)
+            if google_name and not user.first_name:
+                user.first_name = google_name
+            if google_surname and not user.last_name:
+                user.last_name = google_surname
+            db.commit()
+
+        # Session token olustur
+        auth_token = create_session_token(db, user.user_id)
+        logger.info("Google ile giris yapildi: %s", google_email)
+
+        # Popup'a token bilgisini gonder ve kapat
+        return HTMLResponse(content=f"""
+        <script>
+            window.opener.postMessage({{
+                type: 'google-auth',
+                token: '{auth_token}',
+                user_id: '{user.user_id}',
+                username: '{user.username}'
+            }}, '*');
+            window.close();
+        </script>
+        """)
+
+    except Exception as e:
+        logger.error("Google OAuth hatasi: %s", str(e))
+        return HTMLResponse(content=f"<script>window.opener.postMessage({{error:'Google giris hatasi'}}, '*');window.close();</script>")
 
 
 # ========== Profile Settings API (Feature 2) ==========
 
 @app.put("/api/auth/profile")
-@limiter.limit("30/minute")
-async def update_profile(request: Request, req: ProfileUpdateRequest, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def update_profile(request: Request, req: ProfileUpdateRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanici profil bilgilerini guncelle."""
-    user = db.query(User).filter(User.user_id == req.user_id).first()
+    user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
         return Response(content=json.dumps({"error": "Kullanici bulunamadi"}), status_code=404, media_type="application/json")
 
@@ -642,7 +923,7 @@ async def update_profile(request: Request, req: ProfileUpdateRequest, db: Sessio
     if req.username is not None:
         if len(req.username) < 3:
             return Response(content=json.dumps({"error": "Kullanici adi en az 3 karakter olmali"}), status_code=400, media_type="application/json")
-        existing = db.query(User).filter(User.username == req.username, User.user_id != req.user_id).first()
+        existing = db.query(User).filter(User.username == req.username, User.user_id != user_id).first()
         if existing:
             return Response(content=json.dumps({"error": "Bu kullanici adi zaten alinmis"}), status_code=409, media_type="application/json")
         user.username = req.username
@@ -659,7 +940,7 @@ async def update_profile(request: Request, req: ProfileUpdateRequest, db: Sessio
     if req.email is not None and req.email != user.email:
         if "@" not in req.email or "." not in req.email:
             return Response(content=json.dumps({"error": "Gecerli bir e-posta adresi girin"}), status_code=400, media_type="application/json")
-        existing_email = db.query(User).filter(User.email == req.email, User.email_verified == True, User.user_id != req.user_id).first()
+        existing_email = db.query(User).filter(User.email == req.email, User.email_verified == True, User.user_id != user_id).first()
         if existing_email:
             return Response(content=json.dumps({"error": "Bu e-posta adresi baska bir hesapta kayitli"}), status_code=409, media_type="application/json")
         user.email = req.email
@@ -670,7 +951,7 @@ async def update_profile(request: Request, req: ProfileUpdateRequest, db: Sessio
         send_verification_email(req.email, code, user.username)
 
     db.commit()
-    logger.info("Profil guncellendi: user_id=%s", req.user_id)
+    logger.info("Profil guncellendi: user_id=%s", user_id)
     return {
         "user_id": user.user_id,
         "username": user.username,
@@ -683,8 +964,8 @@ async def update_profile(request: Request, req: ProfileUpdateRequest, db: Sessio
 
 
 @app.put("/api/auth/password")
-@limiter.limit("30/minute")
-async def change_password(request: Request, req: PasswordChangeRequest, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def change_password(request: Request, req: PasswordChangeRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanici sifresini degistir."""
     if not req.new_password:
         return Response(content=json.dumps({"error": "Yeni sifre gerekli"}), status_code=400, media_type="application/json")
@@ -692,7 +973,7 @@ async def change_password(request: Request, req: PasswordChangeRequest, db: Sess
     if pw_error:
         return Response(content=json.dumps({"error": pw_error}), status_code=400, media_type="application/json")
 
-    user = db.query(User).filter(User.user_id == req.user_id).first()
+    user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
         return Response(content=json.dumps({"error": "Kullanici bulunamadi"}), status_code=404, media_type="application/json")
 
@@ -700,14 +981,15 @@ async def change_password(request: Request, req: PasswordChangeRequest, db: Sess
         return Response(content=json.dumps({"error": "Mevcut sifre hatali"}), status_code=401, media_type="application/json")
 
     user.password_hash = hash_password(req.new_password)
+    delete_all_user_tokens(db, user_id)
     db.commit()
-    logger.info("Kullanici sifresi degistirildi: user_id=%s", req.user_id)
+    logger.info("Kullanici sifresi degistirildi: user_id=%s", user_id)
     return {"ok": True, "message": "Sifre basariyla degistirildi"}
 
 
 @app.get("/api/auth/profile")
-@limiter.limit("30/minute")
-async def get_profile(request: Request, user_id: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def get_profile(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanici profil bilgilerini getir."""
     user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
@@ -728,8 +1010,8 @@ async def get_profile(request: Request, user_id: str, db: Session = Depends(get_
 # ========== Sohbet Gecmisi API ==========
 
 @app.get("/api/sessions")
-@limiter.limit("30/minute")
-async def list_sessions(request: Request, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def list_sessions(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanicinin sohbet oturumlarini listele (soft-deleted olanlari haric tut)."""
     query = db.query(
         ChatHistory.session_id,
@@ -738,10 +1020,8 @@ async def list_sessions(request: Request, user_id: Optional[str] = None, db: Ses
     ).filter(
         ChatHistory.role == "user",
         ChatHistory.deleted_at.is_(None),
+        ChatHistory.user_id == user_id,
     )
-
-    if user_id:
-        query = query.filter(ChatHistory.user_id == user_id)
 
     sessions = (
         query
@@ -790,17 +1070,51 @@ async def list_sessions(request: Request, user_id: Optional[str] = None, db: Ses
     return result
 
 
+class BulkDeleteRequest(BaseModel):
+    session_ids: List[str]
+
+
+@app.post("/api/sessions/bulk-delete")
+@limiter.limit("120/minute")
+async def bulk_delete_sessions(request: Request, req: BulkDeleteRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Birden fazla sohbeti toplu olarak cop kutusuna gonder."""
+    now = datetime.utcnow()
+    count = 0
+    for sid in req.session_ids:
+        updated = db.query(ChatHistory).filter(
+            ChatHistory.session_id == sid,
+            ChatHistory.user_id == user_id,
+        ).update({"deleted_at": now})
+        count += updated
+    db.commit()
+    logger.info("Toplu silme: %d oturum cop kutusuna tasindi", len(req.session_ids))
+    return {"ok": True, "deleted_sessions": len(req.session_ids)}
+
+
+@app.delete("/api/sessions/clear-all")
+@limiter.limit("120/minute")
+async def clear_all_sessions(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Kullanicinin tum sohbetlerini cop kutusuna gonder."""
+    now = datetime.utcnow()
+    count = db.query(ChatHistory).filter(
+        ChatHistory.user_id == user_id,
+        ChatHistory.deleted_at.is_(None),
+    ).update({"deleted_at": now})
+    db.commit()
+    logger.info("Tum sohbetler cop kutusuna tasindi: user=%s, %d mesaj", user_id, count)
+    return {"ok": True, "deleted_messages": count}
+
+
 @app.delete("/api/sessions/{session_id}")
-@limiter.limit("30/minute")
-async def delete_session(request: Request, session_id: str, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def delete_session(request: Request, session_id: str, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Belirli bir sohbet oturumunu soft-delete yap (cop kutusuna gonder)."""
-    if user_id:
-        # Sadece bu kullaniciya ait sohbeti kontrol et
-        first = db.query(ChatHistory).filter(
-            ChatHistory.session_id == session_id, ChatHistory.user_id == user_id
-        ).first()
-        if not first:
-            return {"error": "Bu sohbet size ait degil"}
+    # Sadece bu kullaniciya ait sohbeti kontrol et
+    first = db.query(ChatHistory).filter(
+        ChatHistory.session_id == session_id, ChatHistory.user_id == user_id
+    ).first()
+    if not first:
+        return {"error": "Bu sohbet size ait degil"}
 
     now = datetime.utcnow()
     db.query(ChatHistory).filter(
@@ -813,24 +1127,22 @@ async def delete_session(request: Request, session_id: str, user_id: Optional[st
 
 class SessionTitleUpdate(BaseModel):
     title: str
-    user_id: Optional[str] = None
 
 
 @app.put("/api/sessions/{session_id}/title")
-@limiter.limit("30/minute")
-async def update_session_title(request: Request, session_id: str, req: SessionTitleUpdate, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def update_session_title(request: Request, session_id: str, req: SessionTitleUpdate, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Sohbet basligini duzenle."""
-    if req.user_id:
-        # Yetki kontrolu: bu oturum kullaniciya ait mi?
-        first = db.query(ChatHistory).filter(
-            ChatHistory.session_id == session_id, ChatHistory.user_id == req.user_id
-        ).first()
-        if not first:
-            return Response(
-                content=json.dumps({"error": "Bu sohbet size ait degil"}),
-                status_code=403,
-                media_type="application/json",
-            )
+    # Yetki kontrolu: bu oturum kullaniciya ait mi?
+    first = db.query(ChatHistory).filter(
+        ChatHistory.session_id == session_id, ChatHistory.user_id == user_id
+    ).first()
+    if not first:
+        return Response(
+            content=json.dumps({"error": "Bu sohbet size ait degil"}),
+            status_code=403,
+            media_type="application/json",
+        )
 
     meta = db.query(SessionMeta).filter(SessionMeta.session_id == session_id).first()
     if meta:
@@ -844,7 +1156,7 @@ async def update_session_title(request: Request, session_id: str, req: SessionTi
 
 
 @app.get("/api/sessions/{session_id}/messages")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def get_session_messages(request: Request, session_id: str, db: Session = Depends(get_db)):
     """Belirli bir oturumun tum mesajlarini getir."""
     messages = (
@@ -856,11 +1168,74 @@ async def get_session_messages(request: Request, session_id: str, db: Session = 
     return [{"role": m.role, "content": m.content} for m in messages]
 
 
+# ========== Sohbet Arama API ==========
+
+@app.get("/api/sessions/search")
+@limiter.limit("120/minute")
+async def search_sessions(request: Request, q: str, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Kullanicinin sohbet gecmisinde arama yap."""
+    if not q or len(q.strip()) < 2:
+        return []
+
+    pattern = f"%{q.strip()}%"
+    # Mesaj iceriginde ara
+    matching = (
+        db.query(ChatHistory.session_id, ChatHistory.content, ChatHistory.role)
+        .filter(
+            ChatHistory.user_id == user_id,
+            ChatHistory.content.ilike(pattern),
+            ChatHistory.deleted_at.is_(None),
+        )
+        .order_by(ChatHistory.id.desc())
+        .limit(30)
+        .all()
+    )
+
+    # Session bazinda grupla, her session icin ilk eslesen snippet'i goster
+    seen = {}
+    results = []
+    for m in matching:
+        if m.session_id in seen:
+            continue
+        seen[m.session_id] = True
+
+        # Eslesen kismi snippet olarak cikar
+        content_lower = m.content.lower()
+        q_lower = q.lower()
+        idx = content_lower.find(q_lower)
+        if idx >= 0:
+            start = max(0, idx - 40)
+            end = min(len(m.content), idx + len(q) + 60)
+            snippet = ("..." if start > 0 else "") + m.content[start:end] + ("..." if end < len(m.content) else "")
+        else:
+            snippet = m.content[:100]
+
+        # Session basligini bul
+        meta = db.query(SessionMeta).filter(SessionMeta.session_id == m.session_id).first()
+        if meta and meta.custom_title:
+            title = meta.custom_title
+        else:
+            first_msg = db.query(ChatHistory).filter(
+                ChatHistory.session_id == m.session_id,
+                ChatHistory.role == "user",
+            ).order_by(ChatHistory.id.asc()).first()
+            title = first_msg.content[:50] if first_msg else "Sohbet"
+
+        results.append({
+            "session_id": m.session_id,
+            "title": title,
+            "snippet": snippet,
+            "role": m.role,
+        })
+
+    return results
+
+
 # ========== Trash / Cop Kutusu API (Feature 3) ==========
 
 @app.get("/api/trash")
-@limiter.limit("30/minute")
-async def list_trash(request: Request, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def list_trash(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Soft-deleted sohbet oturumlarini listele."""
     query = db.query(
         ChatHistory.session_id,
@@ -869,10 +1244,8 @@ async def list_trash(request: Request, user_id: Optional[str] = None, db: Sessio
     ).filter(
         ChatHistory.role == "user",
         ChatHistory.deleted_at.isnot(None),
+        ChatHistory.user_id == user_id,
     )
-
-    if user_id:
-        query = query.filter(ChatHistory.user_id == user_id)
 
     sessions = (
         query
@@ -904,7 +1277,7 @@ async def list_trash(request: Request, user_id: Optional[str] = None, db: Sessio
 
 
 @app.post("/api/trash/{session_id}/restore")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def restore_session(request: Request, session_id: str, db: Session = Depends(get_db)):
     """Cop kutusundaki sohbeti geri yukle (deleted_at = NULL)."""
     count = db.query(ChatHistory).filter(
@@ -917,7 +1290,7 @@ async def restore_session(request: Request, session_id: str, db: Session = Depen
 
 
 @app.delete("/api/trash/{session_id}/permanent")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def permanent_delete_session(request: Request, session_id: str, db: Session = Depends(get_db)):
     """Cop kutusundaki sohbeti kalici olarak sil."""
     count = db.query(ChatHistory).filter(
@@ -929,12 +1302,13 @@ async def permanent_delete_session(request: Request, session_id: str, db: Sessio
 
 
 @app.delete("/api/trash/empty")
-@limiter.limit("30/minute")
-async def empty_trash(request: Request, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def empty_trash(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Cop kutusunu tamamen bosalt - tum soft-deleted oturumlari kalici sil."""
-    query = db.query(ChatHistory).filter(ChatHistory.deleted_at.isnot(None))
-    if user_id:
-        query = query.filter(ChatHistory.user_id == user_id)
+    query = db.query(ChatHistory).filter(
+        ChatHistory.deleted_at.isnot(None),
+        ChatHistory.user_id == user_id,
+    )
     count = query.delete()
     db.commit()
     logger.info("Cop kutusu bosaltildi: user_id=%s, %d mesaj silindi", user_id, count)
@@ -944,21 +1318,17 @@ async def empty_trash(request: Request, user_id: Optional[str] = None, db: Sessi
 # ========== Chat Folders API ==========
 
 class ChatFolderCreate(BaseModel):
-    user_id: str
     name: str
 
 
 class SessionMoveRequest(BaseModel):
     folder_id: Optional[int] = None
-    user_id: Optional[str] = None
 
 
 @app.get("/api/chat-folders")
-@limiter.limit("30/minute")
-async def list_chat_folders(request: Request, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def list_chat_folders(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanicinin sohbet klasorlerini listele."""
-    if not user_id:
-        return []
     folders = (
         db.query(ChatFolder)
         .filter(ChatFolder.user_id == user_id)
@@ -970,19 +1340,19 @@ async def list_chat_folders(request: Request, user_id: Optional[str] = None, db:
 
 
 @app.post("/api/chat-folders")
-@limiter.limit("30/minute")
-async def create_chat_folder(request: Request, req: ChatFolderCreate, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def create_chat_folder(request: Request, req: ChatFolderCreate, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Yeni sohbet klasoru olustur."""
-    folder = ChatFolder(user_id=req.user_id, name=req.name)
+    folder = ChatFolder(user_id=user_id, name=req.name)
     db.add(folder)
     db.commit()
     db.refresh(folder)
-    logger.info("Yeni sohbet klasoru olusturuldu: user_id=%s, name=%s", req.user_id, req.name)
+    logger.info("Yeni sohbet klasoru olusturuldu: user_id=%s, name=%s", user_id, req.name)
     return {"id": folder.id, "name": folder.name}
 
 
 @app.delete("/api/chat-folders/{folder_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def delete_chat_folder(request: Request, folder_id: int, db: Session = Depends(get_db)):
     """Sohbet klasorunu sil. Icindeki sohbetler klasorsuz olur."""
     folder = db.query(ChatFolder).get(folder_id)
@@ -996,8 +1366,8 @@ async def delete_chat_folder(request: Request, folder_id: int, db: Session = Dep
 
 
 @app.put("/api/sessions/{session_id}/move")
-@limiter.limit("30/minute")
-async def move_session_to_folder(request: Request, session_id: str, req: SessionMoveRequest, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def move_session_to_folder(request: Request, session_id: str, req: SessionMoveRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Sohbeti bir klasore tasi veya klasorden cikar."""
     meta = db.query(SessionMeta).filter(SessionMeta.session_id == session_id).first()
     if meta:
@@ -1046,8 +1416,8 @@ def check_message_limit(db: Session, user_id: str) -> dict:
 
 
 @app.get("/api/chat/limit")
-@limiter.limit("30/minute")
-async def get_chat_limit(request: Request, user_id: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def get_chat_limit(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanicinin kalan mesaj hakkini getir."""
     return check_message_limit(db, user_id)
 
@@ -1056,7 +1426,7 @@ async def get_chat_limit(request: Request, user_id: str, db: Session = Depends(g
 
 @app.post("/api/chat/stream")
 @limiter.limit("10/minute")
-async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(get_db)):
+async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """
     Streaming chat endpoint. Server-Sent Events (SSE) ile
     GPT yanitini parca parca gonderir (typewriter efekti).
@@ -1065,7 +1435,7 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
     logger.info("Streaming chat istegi - session: %s, mesaj: %s", session_id, req.message[:80])
 
     # Kullanim limiti kontrolu
-    limit_info = check_message_limit(db, req.user_id)
+    limit_info = check_message_limit(db, user_id)
     if not limit_info["allowed"]:
         mins = limit_info.get("minutes_until_next", 60)
         if mins >= 60:
@@ -1096,7 +1466,7 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
     messages = build_messages(db, session_id, req.message, recipe_context)
 
     # Kullanici mesajini hemen kaydet (user_id ile)
-    db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="user", content=req.message))
+    db.add(ChatHistory(session_id=session_id, user_id=user_id, role="user", content=req.message))
     db.commit()
 
     # Ilk mesaj mi kontrol et (baslik yanit sonrasi olusturulacak)
@@ -1180,7 +1550,7 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
                 references = []
 
         # Yanitı DB'ye kaydet
-        db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="assistant", content=full_reply))
+        db.add(ChatHistory(session_id=session_id, user_id=user_id, role="assistant", content=full_reply))
         db.commit()
 
         # Ilk mesajsa GPT yanitindan dogru yazimli baslik olustur
@@ -1204,12 +1574,12 @@ async def chat_stream(request: Request, req: ChatRequest, db: Session = Depends(
 
 @app.post("/api/chat", response_model=ChatResponse)
 @limiter.limit("10/minute")
-async def chat(request: Request, req: ChatRequest, db: Session = Depends(get_db)):
+async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     session_id = req.session_id or str(uuid.uuid4())
     logger.info("Chat istegi - session: %s, mesaj: %s", session_id, req.message[:80])
 
     # Kullanim limiti kontrolu
-    limit_info = check_message_limit(db, req.user_id)
+    limit_info = check_message_limit(db, user_id)
     if not limit_info["allowed"]:
         return Response(
             content=json.dumps({"error": "Gunluk mesaj limitiniz doldu."}),
@@ -1224,8 +1594,8 @@ async def chat(request: Request, req: ChatRequest, db: Session = Depends(get_db)
         if cached and cached.created_at and (datetime.utcnow() - cached.created_at).days < 7:
             logger.info("Non-streaming: onbellekten tarif bulundu: key=%s", cache_key)
             references = json.loads(cached.references_json) if cached.references_json else []
-            db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="user", content=req.message))
-            db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="assistant", content=cached.response))
+            db.add(ChatHistory(session_id=session_id, user_id=user_id, role="user", content=req.message))
+            db.add(ChatHistory(session_id=session_id, user_id=user_id, role="assistant", content=cached.response))
             db.commit()
             return ChatResponse(reply=cached.response, session_id=session_id, references=references)
 
@@ -1273,15 +1643,15 @@ async def chat(request: Request, req: ChatRequest, db: Session = Depends(get_db)
         except Exception as e:
             logger.error("Non-streaming cache kayit hatasi: %s", str(e))
 
-    db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="user", content=req.message))
-    db.add(ChatHistory(session_id=session_id, user_id=req.user_id, role="assistant", content=reply))
+    db.add(ChatHistory(session_id=session_id, user_id=user_id, role="user", content=req.message))
+    db.add(ChatHistory(session_id=session_id, user_id=user_id, role="assistant", content=reply))
     db.commit()
 
     return ChatResponse(reply=reply, session_id=session_id, references=references)
 
 
 @app.get("/api/recipes")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def list_recipes(request: Request, category: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(Recipe)
     if category:
@@ -1294,7 +1664,6 @@ async def list_recipes(request: Request, category: Optional[str] = None, db: Ses
 # ================================================================
 
 class BookCreate(BaseModel):
-    user_id: str
     name: str
 
 class FolderCreate(BaseModel):
@@ -1316,17 +1685,17 @@ class EditRecipeRequest(BaseModel):
 # --- Defter (Book) CRUD ---
 
 @app.get("/api/books")
-@limiter.limit("30/minute")
-async def list_books(request: Request, user_id: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def list_books(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     return [
         {"id": b.id, "name": b.name}
         for b in db.query(RecipeBook).filter(RecipeBook.user_id == user_id).order_by(RecipeBook.id).all()
     ]
 
 @app.post("/api/books")
-@limiter.limit("30/minute")
-async def create_book(request: Request, req: BookCreate, db: Session = Depends(get_db)):
-    book = RecipeBook(user_id=req.user_id, name=req.name)
+@limiter.limit("120/minute")
+async def create_book(request: Request, req: BookCreate, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    book = RecipeBook(user_id=user_id, name=req.name)
     db.add(book)
     db.commit()
     db.refresh(book)
@@ -1334,7 +1703,7 @@ async def create_book(request: Request, req: BookCreate, db: Session = Depends(g
     return {"id": book.id, "name": book.name}
 
 @app.put("/api/books/{book_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def rename_book(request: Request, book_id: int, req: RenameRequest, db: Session = Depends(get_db)):
     book = db.query(RecipeBook).get(book_id)
     if not book:
@@ -1344,12 +1713,12 @@ async def rename_book(request: Request, book_id: int, req: RenameRequest, db: Se
     return {"id": book.id, "name": book.name}
 
 @app.delete("/api/books/{book_id}")
-@limiter.limit("30/minute")
-async def delete_book(request: Request, book_id: int, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def delete_book(request: Request, book_id: int, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     book = db.query(RecipeBook).get(book_id)
     if not book:
         return {"ok": True}
-    if user_id and book.user_id != user_id:
+    if book.user_id != user_id:
         return Response(content=json.dumps({"error": "Bu defter size ait degil"}), status_code=403, media_type="application/json")
     db.delete(book)
     db.commit()
@@ -1360,7 +1729,7 @@ async def delete_book(request: Request, book_id: int, user_id: Optional[str] = N
 # --- Klasor (Folder) CRUD ---
 
 @app.get("/api/books/{book_id}/folders")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def list_folders(request: Request, book_id: int, db: Session = Depends(get_db)):
     folders = db.query(BookFolder).filter(BookFolder.book_id == book_id).order_by(BookFolder.sort_order).all()
     return [
@@ -1369,7 +1738,7 @@ async def list_folders(request: Request, book_id: int, db: Session = Depends(get
     ]
 
 @app.post("/api/books/{book_id}/folders")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def create_folder(request: Request, book_id: int, req: FolderCreate, db: Session = Depends(get_db)):
     folder = BookFolder(book_id=book_id, name=req.name)
     db.add(folder)
@@ -1378,7 +1747,7 @@ async def create_folder(request: Request, book_id: int, req: FolderCreate, db: S
     return {"id": folder.id, "name": folder.name}
 
 @app.delete("/api/folders/{folder_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def delete_folder(request: Request, folder_id: int, db: Session = Depends(get_db)):
     folder = db.query(BookFolder).get(folder_id)
     if folder:
@@ -1390,7 +1759,7 @@ async def delete_folder(request: Request, folder_id: int, db: Session = Depends(
 # --- Kayitli Tarifler ---
 
 @app.get("/api/folders/{folder_id}/recipes")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def list_saved_recipes(request: Request, folder_id: int, db: Session = Depends(get_db)):
     recipes = (
         db.query(SavedRecipe)
@@ -1404,7 +1773,7 @@ async def list_saved_recipes(request: Request, folder_id: int, db: Session = Dep
     return [{"id": r.id, "title": r.title, "content": r.content, "share_token": r.share_token, "rating": r.rating} for r in recipes]
 
 @app.post("/api/folders/{folder_id}/recipes")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def save_recipe(request: Request, folder_id: int, req: SaveRecipeRequest, db: Session = Depends(get_db)):
     recipe = SavedRecipe(
         folder_id=folder_id,
@@ -1419,7 +1788,7 @@ async def save_recipe(request: Request, folder_id: int, req: SaveRecipeRequest, 
     return {"id": recipe.id, "title": recipe.title}
 
 @app.delete("/api/saved-recipes/{recipe_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def delete_saved_recipe(request: Request, recipe_id: int, db: Session = Depends(get_db)):
     recipe = db.query(SavedRecipe).get(recipe_id)
     if recipe:
@@ -1431,7 +1800,7 @@ async def delete_saved_recipe(request: Request, recipe_id: int, db: Session = De
 # --- Tarif Duzenleme ---
 
 @app.put("/api/saved-recipes/{recipe_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def edit_saved_recipe(request: Request, recipe_id: int, req: EditRecipeRequest, db: Session = Depends(get_db)):
     """Kayitli tarifi duzenle."""
     recipe = db.query(SavedRecipe).get(recipe_id)
@@ -1451,7 +1820,7 @@ class RateRecipeRequest(BaseModel):
 
 
 @app.put("/api/saved-recipes/{recipe_id}/rate")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def rate_saved_recipe(request: Request, recipe_id: int, req: RateRecipeRequest, db: Session = Depends(get_db)):
     """Kayitli tarife puan ver (1-5)."""
     if req.rating < 1 or req.rating > 5:
@@ -1472,7 +1841,7 @@ async def rate_saved_recipe(request: Request, recipe_id: int, req: RateRecipeReq
 # --- Tarif Paylasimi ---
 
 @app.post("/api/saved-recipes/{recipe_id}/share")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def share_recipe(request: Request, recipe_id: int, db: Session = Depends(get_db)):
     """Tarif icin paylasim linki olustur."""
     recipe = db.query(SavedRecipe).get(recipe_id)
@@ -1489,7 +1858,7 @@ async def share_recipe(request: Request, recipe_id: int, db: Session = Depends(g
 
 
 @app.get("/api/shared/{token}", response_class=HTMLResponse)
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def view_shared_recipe(request: Request, token: str, db: Session = Depends(get_db)):
     """Paylasilan tarifi HTML sayfasi olarak goster."""
     recipe = db.query(SavedRecipe).filter(SavedRecipe.share_token == token).first()
@@ -1508,10 +1877,10 @@ async def view_shared_recipe(request: Request, token: str, db: Session = Depends
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {{ font-family: 'Inter', sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #eee; }}
-        h1 {{ color: #e74c3c; font-size: 24px; margin-bottom: 8px; }}
-        .badge {{ display: inline-block; padding: 4px 12px; background: rgba(192,57,43,0.2); border: 1px solid rgba(192,57,43,0.4); border-radius: 14px; color: #e78b84; font-size: 12px; margin-bottom: 20px; }}
+        h1 {{ color: #10b981; font-size: 24px; margin-bottom: 8px; }}
+        .badge {{ display: inline-block; padding: 4px 12px; background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.4); border-radius: 14px; color: #6ee7b7; font-size: 12px; margin-bottom: 20px; }}
         .content {{ background: #1e2a4a; padding: 24px; border-radius: 12px; line-height: 1.6; }}
-        .content strong {{ color: #e74c3c; }}
+        .content strong {{ color: #10b981; }}
         .content h1, .content h2, .content h3 {{ margin: 14px 0 6px; }}
         .content ul, .content ol {{ padding-left: 22px; }}
         .content p {{ margin-bottom: 8px; }}
@@ -1531,8 +1900,8 @@ async def view_shared_recipe(request: Request, token: str, db: Session = Depends
 # --- Kayitli Tariflerde Arama ---
 
 @app.get("/api/saved-recipes/search")
-@limiter.limit("30/minute")
-async def search_saved_recipes(request: Request, user_id: str, q: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def search_saved_recipes(request: Request, q: str, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanicinin kayitli tarifleri arasinda arama yap."""
     if not q or len(q.strip()) < 2:
         return []
@@ -1569,8 +1938,8 @@ async def search_saved_recipes(request: Request, user_id: str, q: str, db: Sessi
 # --- Defter Agaci (Modal icin) ---
 
 @app.get("/api/books-tree")
-@limiter.limit("30/minute")
-async def books_tree(request: Request, user_id: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def books_tree(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     books = db.query(RecipeBook).filter(RecipeBook.user_id == user_id).order_by(RecipeBook.id).all()
     return [
         {
@@ -1674,7 +2043,7 @@ class SaveRecipeToBookRequest(BaseModel):
 
 
 @app.post("/api/books/{book_id}/save-recipe")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def save_recipe_to_book(request: Request, book_id: int, req: SaveRecipeToBookRequest, db: Session = Depends(get_db)):
     """Tarifi direkt deftere kaydet. Klasor secilmemisse 'Genel' klasoru olusturulur."""
     book = db.query(RecipeBook).get(book_id)
@@ -1709,7 +2078,7 @@ async def save_recipe_to_book(request: Request, book_id: int, req: SaveRecipeToB
 # --- PDF Export (Defter, Klasor, Tek Tarif) ---
 
 @app.get("/api/books/{book_id}/export-pdf")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def export_book_pdf(request: Request, book_id: int, db: Session = Depends(get_db)):
     book = db.query(RecipeBook).get(book_id)
     if not book:
@@ -1743,7 +2112,7 @@ async def export_book_pdf(request: Request, book_id: int, db: Session = Depends(
 
 
 @app.get("/api/folders/{folder_id}/export-pdf")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def export_folder_pdf(request: Request, folder_id: int, db: Session = Depends(get_db)):
     folder = db.query(BookFolder).get(folder_id)
     if not folder:
@@ -1772,7 +2141,7 @@ async def export_folder_pdf(request: Request, folder_id: int, db: Session = Depe
 
 
 @app.get("/api/saved-recipes/{recipe_id}/export-pdf")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def export_recipe_pdf(request: Request, recipe_id: int, db: Session = Depends(get_db)):
     recipe = db.query(SavedRecipe).get(recipe_id)
     if not recipe:
@@ -1801,13 +2170,11 @@ async def export_recipe_pdf(request: Request, recipe_id: int, db: Session = Depe
 # ================================================================
 
 class ShoppingListCreate(BaseModel):
-    user_id: str
     title: str
     items: List[str]
 
 
 class ShoppingListFromRecipe(BaseModel):
-    user_id: str
     recipe_content: str
 
 
@@ -1847,8 +2214,8 @@ def extract_ingredients_from_recipe(content: str) -> List[str]:
 
 
 @app.get("/api/shopping-lists")
-@limiter.limit("30/minute")
-async def list_shopping_lists(request: Request, user_id: str, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def list_shopping_lists(request: Request, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Kullanicinin alisveris listelerini getir."""
     lists = (
         db.query(ShoppingList)
@@ -1868,18 +2235,18 @@ async def list_shopping_lists(request: Request, user_id: str, db: Session = Depe
 
 
 @app.post("/api/shopping-lists")
-@limiter.limit("30/minute")
-async def create_shopping_list(request: Request, req: ShoppingListCreate, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def create_shopping_list(request: Request, req: ShoppingListCreate, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Yeni alisveris listesi olustur."""
     sl = ShoppingList(
-        user_id=req.user_id,
+        user_id=user_id,
         title=req.title,
         items=json.dumps(req.items, ensure_ascii=False),
     )
     db.add(sl)
     db.commit()
     db.refresh(sl)
-    logger.info("Alisveris listesi olusturuldu: user=%s, baslik=%s", req.user_id, req.title)
+    logger.info("Alisveris listesi olusturuldu: user=%s, baslik=%s", user_id, req.title)
     return {
         "id": sl.id,
         "title": sl.title,
@@ -1889,7 +2256,7 @@ async def create_shopping_list(request: Request, req: ShoppingListCreate, db: Se
 
 
 @app.delete("/api/shopping-lists/{list_id}")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def delete_shopping_list(request: Request, list_id: int, db: Session = Depends(get_db)):
     """Alisveris listesini sil."""
     sl = db.query(ShoppingList).get(list_id)
@@ -1901,8 +2268,8 @@ async def delete_shopping_list(request: Request, list_id: int, db: Session = Dep
 
 
 @app.post("/api/shopping-lists/from-recipe")
-@limiter.limit("30/minute")
-async def create_shopping_list_from_recipe(request: Request, req: ShoppingListFromRecipe, db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+async def create_shopping_list_from_recipe(request: Request, req: ShoppingListFromRecipe, user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Tarif iceriginden malzemeleri cikarip alisveris listesi olustur."""
     ingredients = extract_ingredients_from_recipe(req.recipe_content)
     if not ingredients:
@@ -1917,14 +2284,14 @@ async def create_shopping_list_from_recipe(request: Request, req: ShoppingListFr
     title = first_line[:50] if first_line else "Tarif Malzemeleri"
 
     sl = ShoppingList(
-        user_id=req.user_id,
+        user_id=user_id,
         title=title,
         items=json.dumps(ingredients, ensure_ascii=False),
     )
     db.add(sl)
     db.commit()
     db.refresh(sl)
-    logger.info("Tariften alisveris listesi olusturuldu: user=%s, malzeme_sayisi=%d", req.user_id, len(ingredients))
+    logger.info("Tariften alisveris listesi olusturuldu: user=%s, malzeme_sayisi=%d", user_id, len(ingredients))
     return {
         "id": sl.id,
         "title": sl.title,
@@ -1938,7 +2305,7 @@ async def create_shopping_list_from_recipe(request: Request, req: ShoppingListFr
 # ================================================================
 
 @app.delete("/api/sessions/{session_id}/rewind")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def rewind_session(request: Request, session_id: str, count: int = 1, db: Session = Depends(get_db)):
     """Sohbetin son N mesajini sil (mesaj duzenleme icin)."""
     messages = (
@@ -1960,7 +2327,7 @@ class ShareMessageRequest(BaseModel):
 
 
 @app.post("/api/messages/share")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def share_message(request: Request, req: ShareMessageRequest, db: Session = Depends(get_db)):
     """Herhangi bir mesaj icin paylasim linki olustur."""
     if not req.content or len(req.content.strip()) < 5:
@@ -1986,7 +2353,7 @@ async def share_message(request: Request, req: ShareMessageRequest, db: Session 
 
 
 @app.get("/api/shared-message/{token}", response_class=HTMLResponse)
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def view_shared_message(request: Request, token: str, db: Session = Depends(get_db)):
     """Paylasilan mesaji HTML sayfasi olarak goster."""
     shared = db.query(SharedMessage).filter(SharedMessage.share_token == token).first()
@@ -2005,10 +2372,10 @@ async def view_shared_message(request: Request, token: str, db: Session = Depend
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {{ font-family: 'Inter', sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #eee; }}
-        h1 {{ color: #e74c3c; font-size: 24px; margin-bottom: 8px; }}
-        .badge {{ display: inline-block; padding: 4px 12px; background: rgba(192,57,43,0.2); border: 1px solid rgba(192,57,43,0.4); border-radius: 14px; color: #e78b84; font-size: 12px; margin-bottom: 20px; }}
+        h1 {{ color: #10b981; font-size: 24px; margin-bottom: 8px; }}
+        .badge {{ display: inline-block; padding: 4px 12px; background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.4); border-radius: 14px; color: #6ee7b7; font-size: 12px; margin-bottom: 20px; }}
         .content {{ background: #1e2a4a; padding: 24px; border-radius: 12px; line-height: 1.7; }}
-        .content strong {{ color: #e74c3c; }}
+        .content strong {{ color: #10b981; }}
         .content h1, .content h2, .content h3 {{ margin: 14px 0 6px; }}
         .content ul, .content ol {{ padding-left: 22px; }}
         .content p {{ margin-bottom: 8px; }}

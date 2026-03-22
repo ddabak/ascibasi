@@ -8,13 +8,37 @@ function safeMarkdown(text) {
 // ========== Auth State ==========
 var authMode = 'login'; // 'login', 'register', 'verify'
 var pendingVerifyEmail = '';
+var authToken = localStorage.getItem('authToken');
 var userId = localStorage.getItem('userId');
 var currentUsername = localStorage.getItem('username') || '';
 
 function checkAuth() {
-    if (!userId) {
+    if (!authToken) {
         document.getElementById('authModal').style.display = 'flex';
     }
+}
+
+// ========== Guvenli Fetch (her istekte token gonderir) ==========
+function authFetch(url, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    if (options.headers instanceof Headers) {
+        if (authToken) options.headers.set('Authorization', 'Bearer ' + authToken);
+    } else {
+        if (authToken) options.headers['Authorization'] = 'Bearer ' + authToken;
+    }
+    return fetch(url, options).then(function(res) {
+        if (res.status === 401 && authToken) {
+            // Token gecersiz veya suresi dolmus - cikis yap
+            localStorage.removeItem('authToken');
+            localStorage.removeItem('userId');
+            localStorage.removeItem('username');
+            authToken = null;
+            userId = null;
+            location.reload();
+        }
+        return res;
+    });
 }
 
 function toggleAuthMode() {
@@ -70,9 +94,15 @@ function maskEmail(email) {
     return name[0] + name[1] + '***@' + domain;
 }
 
+function hideGoogleSection() {
+    var d = document.getElementById('authDivider'); if (d) d.style.display = 'none';
+    var g = document.getElementById('googleLoginContainer'); if (g) g.style.display = 'none';
+}
+
 function showVerifyMode(email, firstName, lastName) {
     authMode = 'verify';
     pendingVerifyEmail = email;
+    hideGoogleSection();
     document.getElementById('registerFields').style.display = 'none';
     document.getElementById('passwordConfirmField').style.display = 'none';
     document.getElementById('verifyCodeField').style.display = 'block';
@@ -101,8 +131,11 @@ function resetAuthForm() {
     var labels = document.getElementById('authModal').querySelectorAll('label');
     labels.forEach(function(l) { l.style.display = ''; });
     document.getElementById('authSwitchBtn').style.display = '';
+    document.getElementById('forgotPasswordLink').style.display = '';
     document.getElementById('verifyCodeField').style.display = 'none';
     document.getElementById('resendCodeBtn').style.display = 'none';
+    document.getElementById('forgotEmailField').style.display = 'none';
+    document.getElementById('resetPasswordFields').style.display = 'none';
     document.getElementById('authVerifyCode').value = '';
     document.getElementById('authFirstName').value = '';
     document.getElementById('authLastName').value = '';
@@ -112,6 +145,19 @@ function resetAuthForm() {
     document.getElementById('authPassword').value = '';
     document.getElementById('authPasswordConfirm').value = '';
     document.getElementById('passwordRules').style.display = 'none';
+    var forgotEl = document.getElementById('forgotEmail');
+    if (forgotEl) forgotEl.value = '';
+    var resetCodeEl = document.getElementById('resetCode');
+    if (resetCodeEl) resetCodeEl.value = '';
+    var resetPwEl = document.getElementById('resetNewPassword');
+    if (resetPwEl) resetPwEl.value = '';
+    var resetPw2El = document.getElementById('resetNewPasswordConfirm');
+    if (resetPw2El) resetPw2El.value = '';
+    // Google login ve ayirici goster
+    var divider = document.getElementById('authDivider');
+    if (divider) divider.style.display = '';
+    var googleContainer = document.getElementById('googleLoginContainer');
+    if (googleContainer) googleContainer.style.display = '';
 }
 
 async function submitAuth() {
@@ -137,8 +183,10 @@ async function submitAuth() {
                 errorEl.style.display = 'block';
                 return;
             }
+            authToken = data.token;
             userId = data.user_id;
             currentUsername = data.username;
+            localStorage.setItem('authToken', authToken);
             localStorage.setItem('userId', userId);
             localStorage.setItem('username', currentUsername);
             document.getElementById('authModal').style.display = 'none';
@@ -148,6 +196,112 @@ async function submitAuth() {
             showToast('Hesabiniz dogrulandi, hos geldiniz!');
             updateProfileUI();
             loadSessions();
+        } catch (e) {
+            errorEl.textContent = 'Baglanti hatasi';
+            errorEl.style.display = 'block';
+        }
+        return;
+    }
+
+    // Login 2FA onay modu
+    if (authMode === 'login-verify') {
+        var code = document.getElementById('authVerifyCode').value.trim();
+        if (!code || code.length !== 6) {
+            errorEl.textContent = '6 haneli onay kodunu girin';
+            errorEl.style.display = 'block';
+            return;
+        }
+        try {
+            var res = await fetch('/api/auth/login-verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: pendingVerifyEmail, code: code })
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                errorEl.textContent = data.error || 'Onay hatasi';
+                errorEl.style.display = 'block';
+                return;
+            }
+            authToken = data.token;
+            userId = data.user_id;
+            currentUsername = data.username;
+            localStorage.setItem('authToken', authToken);
+            localStorage.setItem('userId', userId);
+            localStorage.setItem('username', currentUsername);
+            document.getElementById('authModal').style.display = 'none';
+            resetAuthForm();
+            authMode = 'login';
+            errorEl.style.display = 'none';
+            showToast('Giris basarili!');
+            updateProfileUI();
+            loadSessions();
+            loadTrashCount();
+            updateMessageLimit();
+        } catch (e) {
+            errorEl.textContent = 'Baglanti hatasi';
+            errorEl.style.display = 'block';
+        }
+        return;
+    }
+
+    // Sifremi unuttum - kod gonder
+    if (authMode === 'forgot') {
+        var forgotEmail = document.getElementById('forgotEmail').value.trim();
+        if (!forgotEmail || !forgotEmail.includes('@')) {
+            errorEl.textContent = 'Gecerli bir e-posta adresi girin';
+            errorEl.style.display = 'block';
+            return;
+        }
+        try {
+            var res = await fetch('/api/auth/forgot-password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: forgotEmail })
+            });
+            var data = await res.json();
+            showToast('Sifirlama kodu gonderildi');
+            showResetPassword(forgotEmail);
+            errorEl.style.display = 'none';
+        } catch (e) {
+            errorEl.textContent = 'Baglanti hatasi';
+            errorEl.style.display = 'block';
+        }
+        return;
+    }
+
+    // Sifre sifirlama - kodu dogrula ve yeni sifre belirle
+    if (authMode === 'reset') {
+        var resetCode = document.getElementById('resetCode').value.trim();
+        var newPw = document.getElementById('resetNewPassword').value;
+        var newPw2 = document.getElementById('resetNewPasswordConfirm').value;
+        if (!resetCode || resetCode.length !== 6) {
+            errorEl.textContent = '6 haneli sifirlama kodunu girin';
+            errorEl.style.display = 'block';
+            return;
+        }
+        if (!newPw || newPw !== newPw2) {
+            errorEl.textContent = 'Sifreler eslesmiyor';
+            errorEl.style.display = 'block';
+            return;
+        }
+        try {
+            var res = await fetch('/api/auth/reset-password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: pendingVerifyEmail, code: resetCode, new_password: newPw, new_password_confirm: newPw2 })
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                errorEl.textContent = data.error || 'Sifirlama hatasi';
+                errorEl.style.display = 'block';
+                return;
+            }
+            showToast('Sifreniz degistirildi! Giris yapabilirsiniz.');
+            resetAuthForm();
+            authMode = 'login';
+            toggleAuthMode(); toggleAuthMode(); // Reset UI to login
+            errorEl.style.display = 'none';
         } catch (e) {
             errorEl.textContent = 'Baglanti hatasi';
             errorEl.style.display = 'block';
@@ -231,8 +385,18 @@ async function submitAuth() {
             errorEl.style.display = 'block';
             return;
         }
+        // 2FA: Onay kodu gonderildi
+        if (data.needs_login_code) {
+            showToast('Onay kodu e-posta adresinize gonderildi');
+            showLoginVerifyMode(data.email, data.first_name, data.last_name);
+            errorEl.style.display = 'none';
+            return;
+        }
+        // Direkt giris (2FA olmadan - normalde buraya dusmez)
+        authToken = data.token;
         userId = data.user_id;
         currentUsername = data.username;
+        localStorage.setItem('authToken', authToken);
         localStorage.setItem('userId', userId);
         localStorage.setItem('username', currentUsername);
         document.getElementById('authModal').style.display = 'none';
@@ -241,10 +405,76 @@ async function submitAuth() {
         showToast('Giris basarili!');
         updateProfileUI();
         loadSessions();
+        loadTrashCount();
+        updateMessageLimit();
     } catch (e) {
         errorEl.textContent = 'Baglanti hatasi';
         errorEl.style.display = 'block';
     }
+}
+
+// ========== Login 2FA Onay Modu ==========
+function showLoginVerifyMode(email, firstName, lastName) {
+    authMode = 'login-verify';
+    pendingVerifyEmail = email;
+    hideGoogleSection();
+    document.getElementById('registerFields').style.display = 'none';
+    document.getElementById('passwordConfirmField').style.display = 'none';
+    document.getElementById('verifyCodeField').style.display = 'block';
+    document.getElementById('resendCodeBtn').style.display = 'inline-block';
+    document.getElementById('authModalTitle').textContent = 'Giris Onay Kodu';
+    document.getElementById('authSubmitBtn').textContent = 'Giris Yap';
+    document.getElementById('authSwitchText').textContent = '';
+    document.getElementById('authSwitchBtn').style.display = 'none';
+    document.getElementById('forgotPasswordLink').style.display = 'none';
+    document.getElementById('authUsername').style.display = 'none';
+    document.getElementById('authPassword').style.display = 'none';
+    // Label'lari gizle
+    var labels = document.querySelectorAll('#authModal .modal-body > label');
+    labels.forEach(function(l) { l.style.display = 'none'; });
+
+    var greeting = '';
+    if (firstName && lastName) greeting = 'Sayin ' + firstName + ' ' + lastName + ', ';
+    var maskedEmail = maskEmail(email);
+    document.getElementById('verifyCodeInfo').innerHTML = greeting + 'giris onay kodu <strong>' + maskedEmail + '</strong> adresine gonderildi.';
+}
+
+// ========== Sifremi Unuttum ==========
+function showForgotPassword() {
+    authMode = 'forgot';
+    hideGoogleSection();
+    document.getElementById('registerFields').style.display = 'none';
+    document.getElementById('passwordConfirmField').style.display = 'none';
+    document.getElementById('verifyCodeField').style.display = 'none';
+    document.getElementById('resendCodeBtn').style.display = 'none';
+    document.getElementById('forgotPasswordLink').style.display = 'none';
+    document.getElementById('authModalTitle').textContent = 'Sifremi Unuttum';
+    document.getElementById('authSubmitBtn').textContent = 'Kod Gonder';
+    document.getElementById('authSwitchText').textContent = 'Sifreni hatirladin mi?';
+    document.getElementById('authSwitchBtn').textContent = 'Giris Yap';
+    document.getElementById('authSwitchBtn').style.display = '';
+    document.getElementById('authUsername').style.display = 'none';
+    document.getElementById('authPassword').style.display = 'none';
+    // Label'lari gizle
+    var labels = document.querySelectorAll('#authModal .modal-body > label');
+    labels.forEach(function(l) { l.style.display = 'none'; });
+    // E-posta alani goster
+    document.getElementById('forgotEmailField').style.display = 'block';
+    document.getElementById('authError').style.display = 'none';
+}
+
+function showResetPassword(email) {
+    authMode = 'reset';
+    pendingVerifyEmail = email;
+    document.getElementById('forgotEmailField').style.display = 'none';
+    document.getElementById('resetPasswordFields').style.display = 'block';
+    document.getElementById('authModalTitle').textContent = 'Yeni Sifre Belirle';
+    document.getElementById('authSubmitBtn').textContent = 'Sifreyi Degistir';
+    document.getElementById('authSwitchBtn').style.display = 'none';
+    document.getElementById('authSwitchText').textContent = '';
+
+    var maskedEmail = maskEmail(email);
+    document.getElementById('resetCodeInfo').innerHTML = 'Sifirlama kodu <strong>' + maskedEmail + '</strong> adresine gonderildi.';
 }
 
 async function resendCode() {
@@ -265,6 +495,36 @@ async function resendCode() {
         showToast('Baglanti hatasi');
     }
 }
+
+// ========== Google ile Giris ==========
+function loginWithGoogle() {
+    var w = 500, h = 600;
+    var left = (screen.width - w) / 2;
+    var top = (screen.height - h) / 2;
+    window.open('/api/auth/google/login', 'google-login', 'width=' + w + ',height=' + h + ',left=' + left + ',top=' + top);
+}
+
+// Google popup'tan gelen mesaji dinle
+window.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'google-auth') {
+        authToken = event.data.token;
+        userId = event.data.user_id;
+        currentUsername = event.data.username;
+        localStorage.setItem('authToken', authToken);
+        localStorage.setItem('userId', userId);
+        localStorage.setItem('username', currentUsername);
+        document.getElementById('authModal').style.display = 'none';
+        resetAuthForm();
+        showToast('Google ile giris basarili!');
+        updateProfileUI();
+        loadSessions();
+        loadTrashCount();
+        updateMessageLimit();
+    }
+    if (event.data && event.data.error) {
+        showToast(event.data.error);
+    }
+});
 
 // Handle Enter key and password rules in auth inputs
 document.addEventListener('DOMContentLoaded', function() {
@@ -345,15 +605,45 @@ function createSessionItem(s) {
     var div = document.createElement('div');
     div.className = 'session-item';
     div.setAttribute('data-session-id', s.session_id);
+    div.setAttribute('data-sid', s.session_id);
     if (s.session_id === sessionId) div.classList.add('active');
+
+    // Checkbox (bulk mode icin)
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'session-checkbox';
+    cb.style.display = bulkMode ? '' : 'none';
+    cb.checked = selectedSessions.has(s.session_id);
+    cb.onclick = function(e) { e.stopPropagation(); };
+    cb.onchange = function() {
+        if (cb.checked) {
+            selectedSessions.add(s.session_id);
+        } else {
+            selectedSessions.delete(s.session_id);
+        }
+        updateBulkCount();
+    };
+    div.appendChild(cb);
+
+    if (bulkMode) div.classList.add('bulk-mode');
+
     var titleSpan = document.createElement('span');
     titleSpan.className = 'session-title';
     titleSpan.textContent = s.title;
-    titleSpan.onclick = function() { loadSession(s.session_id); };
+    titleSpan.onclick = function() {
+        if (bulkMode) {
+            cb.checked = !cb.checked;
+            cb.onchange();
+        } else {
+            loadSession(s.session_id);
+        }
+    };
     div.appendChild(titleSpan);
+
     var menuBtn = document.createElement('button');
     menuBtn.className = 'session-menu-btn';
     menuBtn.textContent = '\u2026';
+    menuBtn.style.display = bulkMode ? 'none' : '';
     menuBtn.onclick = function(e) { showSessionMenu(e, s.session_id, s.title); };
     div.appendChild(menuBtn);
     return div;
@@ -362,11 +652,11 @@ function createSessionItem(s) {
 async function loadSessions() {
     try {
         // Load folders
-        var foldersRes = await fetch('/api/chat-folders?user_id=' + (userId || ''));
+        var foldersRes = await authFetch('/api/chat-folders');
         var folders = await foldersRes.json();
 
         // Load sessions
-        var res = await fetch('/api/sessions?user_id=' + (userId || ''));
+        var res = await authFetch('/api/sessions');
         var sessions = await res.json();
 
         sessionListEl.innerHTML = '';
@@ -450,7 +740,15 @@ function showSessionMenu(e, sid, titleText) {
     menu.appendChild(deleteBtn);
 
     // Position near the button
-    e.target.closest('.session-item').appendChild(menu);
+    var sessionItem = e.target.closest('.session-item');
+    sessionItem.appendChild(menu);
+
+    // Ekranin altina yakinsa menuyu yukari ac
+    var menuRect = menu.getBoundingClientRect();
+    if (menuRect.bottom > window.innerHeight - 20) {
+        menu.style.top = 'auto';
+        menu.style.bottom = '100%';
+    }
 }
 
 function closeSessionMenu() {
@@ -465,16 +763,16 @@ document.addEventListener('click', function() { closeSessionMenu(); });
 function promptNewChatFolder() {
     var name = prompt('Yeni klasor adi:');
     if (!name || !name.trim()) return;
-    fetch('/api/chat-folders', {
+    authFetch('/api/chat-folders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: userId, name: name.trim() })
+        body: JSON.stringify({ name: name.trim() })
     }).then(function() { loadSessions(); showToast('Klasor olusturuldu!'); });
 }
 
 async function deleteChatFolder(folderId) {
     try {
-        await fetch('/api/chat-folders/' + folderId, { method: 'DELETE' });
+        await authFetch('/api/chat-folders/' + folderId, { method: 'DELETE' });
         showToast('Klasor silindi');
         loadSessions();
     } catch(e) { showToast('Silme hatasi'); }
@@ -482,7 +780,7 @@ async function deleteChatFolder(folderId) {
 
 async function showMoveToFolderModal(sid) {
     // Fetch folders
-    var foldersRes = await fetch('/api/chat-folders?user_id=' + (userId || ''));
+    var foldersRes = await authFetch('/api/chat-folders');
     var folders = await foldersRes.json();
 
     var overlay = document.createElement('div');
@@ -541,17 +839,17 @@ async function showMoveToFolderModal(sid) {
 
 async function moveSessionToFolder(sid, folderId) {
     try {
-        await fetch('/api/sessions/' + sid + '/move', {
+        await authFetch('/api/sessions/' + sid + '/move', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ folder_id: folderId, user_id: userId })
+            body: JSON.stringify({ folder_id: folderId })
         });
         showToast(folderId ? 'Sohbet klasore tasildi' : 'Sohbet klasorden cikarildi');
         loadSessions();
     } catch(e) { showToast('Tasima hatasi'); }
 }
 
-async function loadSession(sid) {
+async function loadSession(sid, searchQuery) {
     sessionId = sid;
     closeRecipeViewer();
     closeProfilePanel();
@@ -560,13 +858,58 @@ async function loadSession(sid) {
     messagesEl.querySelectorAll('.message').forEach(function(m) { m.remove(); });
     if (welcomeEl) welcomeEl.style.display = 'none';
     try {
-        var res = await fetch('/api/sessions/' + sid + '/messages');
+        var res = await authFetch('/api/sessions/' + sid + '/messages');
         var msgs = await res.json();
         msgs.forEach(function(m) { addMessage(m.content, m.role, null, true); });
-        scrollToBottom();
+
+        if (searchQuery) {
+            // Aranan kelimeyi iceren mesaji bul ve vurgulayarak scroll yap
+            highlightAndScrollToMatch(searchQuery);
+        } else {
+            scrollToBottom();
+        }
     } catch(e) {}
     loadSessions();
     sidebarEl.classList.remove('open'); overlayEl.classList.remove('active');
+}
+
+function highlightAndScrollToMatch(query) {
+    // Render tamamlansin diye kisa gecikme
+    setTimeout(function() {
+        var allMsgs = messagesEl.querySelectorAll('.message');
+        var regex = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+        var found = false;
+
+        for (var i = 0; i < allMsgs.length; i++) {
+            var msg = allMsgs[i];
+            var contentEl = msg.querySelector('.message-content') || msg.querySelector('span');
+            if (!contentEl) continue;
+
+            var text = contentEl.textContent || contentEl.innerText || '';
+            if (text.toLowerCase().includes(query.toLowerCase())) {
+                if (!found) {
+                    // Kelimeyi vurgula
+                    if (msg.querySelector('.message-content')) {
+                        var html = msg.querySelector('.message-content').innerHTML;
+                        msg.querySelector('.message-content').innerHTML = html.replace(regex, '<mark class="search-highlight" style="background:rgba(16,185,129,0.35);color:inherit;border-radius:3px;padding:1px 3px;">$1</mark>');
+                    }
+                    // Vurgulanan ilk mark etiketine scroll yap
+                    var firstMark = msg.querySelector('.search-highlight');
+                    if (firstMark) {
+                        firstMark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    } else {
+                        msg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                    // Parlama efekti
+                    msg.style.outline = '2px solid rgba(16,185,129,0.6)';
+                    msg.style.borderRadius = '12px';
+                    setTimeout(function() { msg.style.outline = ''; }, 3000);
+                    found = true;
+                }
+            }
+        }
+        if (!found) scrollToBottom();
+    }, 200);
 }
 
 // ========== Sohbet Basligini Duzenleme ==========
@@ -586,10 +929,10 @@ function startRenameSession(sid) {
     function save() {
         var newTitle = input.value.trim();
         if (newTitle && newTitle !== currentTitle) {
-            fetch('/api/sessions/' + sid + '/title', {
+            authFetch('/api/sessions/' + sid + '/title', {
                 method: 'PUT',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({title: newTitle, user_id: userId})
+                body: JSON.stringify({title: newTitle})
             }).then(function() { loadSessions(); });
         } else {
             loadSessions();
@@ -604,11 +947,162 @@ function startRenameSession(sid) {
 
 async function deleteSession(sid) {
     try {
-        await fetch('/api/sessions/' + sid + '?user_id=' + (userId || ''), { method: 'DELETE' });
+        await authFetch('/api/sessions/' + sid, { method: 'DELETE' });
         if (sid === sessionId) newChat();
         loadSessions();
         loadTrashCount();
     } catch(e) {}
+}
+
+// ========== Toplu Sohbet Yonetimi ==========
+var bulkMode = false;
+var selectedSessions = new Set();
+
+function enterBulkMode() {
+    bulkMode = true;
+    selectedSessions.clear();
+    document.getElementById('bulkActions').style.display = '';
+    document.getElementById('bulkModeBtn').style.display = 'none';
+    document.getElementById('bulkSelectAll').checked = false;
+    updateBulkCount();
+    // Checkbox'lari goster, menu butonlarini gizle
+    var items = document.querySelectorAll('#sessionList .session-item');
+    items.forEach(function(item) {
+        item.classList.add('bulk-mode');
+        var cb = item.querySelector('.session-checkbox');
+        if (cb) { cb.style.display = ''; cb.checked = false; }
+        var menuBtn = item.querySelector('.session-menu-btn');
+        if (menuBtn) menuBtn.style.display = 'none';
+    });
+}
+
+function exitBulkMode() {
+    bulkMode = false;
+    selectedSessions.clear();
+    document.getElementById('bulkActions').style.display = 'none';
+    document.getElementById('bulkModeBtn').style.display = '';
+    // Checkbox'lari gizle, menu butonlarini goster
+    var items = document.querySelectorAll('#sessionList .session-item');
+    items.forEach(function(item) {
+        item.classList.remove('bulk-mode');
+        var cb = item.querySelector('.session-checkbox');
+        if (cb) { cb.style.display = 'none'; cb.checked = false; }
+        var menuBtn = item.querySelector('.session-menu-btn');
+        if (menuBtn) menuBtn.style.display = '';
+    });
+}
+
+function toggleSelectAll() {
+    var checked = document.getElementById('bulkSelectAll').checked;
+    var items = document.querySelectorAll('#sessionList .session-checkbox');
+    items.forEach(function(cb) {
+        cb.checked = checked;
+        var sid = cb.closest('.session-item').getAttribute('data-sid');
+        if (checked) {
+            selectedSessions.add(sid);
+        } else {
+            selectedSessions.delete(sid);
+        }
+    });
+    updateBulkCount();
+}
+
+function updateBulkCount() {
+    document.getElementById('bulkSelectedCount').textContent = selectedSessions.size + ' secili';
+}
+
+async function bulkDeleteSelected() {
+    if (selectedSessions.size === 0) {
+        showToast('Hicbir sohbet secilmedi');
+        return;
+    }
+    confirmDelete(selectedSessions.size + ' sohbet silinecek. Emin misiniz?', async function() {
+        try {
+            await authFetch('/api/sessions/bulk-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_ids: Array.from(selectedSessions) })
+            });
+            showToast(selectedSessions.size + ' sohbet silindi');
+            exitBulkMode();
+            if (selectedSessions.has(sessionId)) newChat();
+            loadSessions();
+            loadTrashCount();
+        } catch(e) {
+            showToast('Silme hatasi');
+        }
+    });
+}
+
+async function clearAllSessions() {
+    confirmDelete('TUM sohbetleriniz cop kutusuna tasinacak. Emin misiniz?', async function() {
+        try {
+            await authFetch('/api/sessions/clear-all', { method: 'DELETE' });
+            showToast('Tum sohbetler temizlendi');
+            newChat();
+            loadSessions();
+            loadTrashCount();
+        } catch(e) {
+            showToast('Temizleme hatasi');
+        }
+    });
+}
+
+// ========== Sohbet Arama ==========
+var chatSearchTimeout = null;
+function searchChats() {
+    var q = document.getElementById('chatSearchInput').value.trim();
+    var resultsEl = document.getElementById('chatSearchResults');
+    var sessionListEl = document.getElementById('sessionList');
+
+    if (q.length < 2) {
+        resultsEl.style.display = 'none';
+        sessionListEl.style.display = '';
+        return;
+    }
+
+    clearTimeout(chatSearchTimeout);
+    chatSearchTimeout = setTimeout(async function() {
+        try {
+            var res = await authFetch('/api/sessions/search?q=' + encodeURIComponent(q));
+            var results = await res.json();
+            resultsEl.innerHTML = '';
+            sessionListEl.style.display = 'none';
+            resultsEl.style.display = '';
+
+            if (results.length === 0) {
+                resultsEl.innerHTML = '<div class="empty-state">Sonuc bulunamadi</div>';
+                return;
+            }
+
+            results.forEach(function(r) {
+                var item = document.createElement('div');
+                item.className = 'chat-search-item';
+                item.onclick = function() {
+                    var searchTerm = q;
+                    loadSession(r.session_id, searchTerm);
+                    document.getElementById('chatSearchInput').value = '';
+                    resultsEl.style.display = 'none';
+                    sessionListEl.style.display = '';
+                };
+
+                var titleDiv = document.createElement('div');
+                titleDiv.className = 'chat-search-item-title';
+                titleDiv.textContent = r.title;
+                item.appendChild(titleDiv);
+
+                var snippetDiv = document.createElement('div');
+                snippetDiv.className = 'chat-search-item-snippet';
+                // Aranan kelimeyi vurgula
+                var escaped = DOMPurify.sanitize(r.snippet);
+                var regex = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+                snippetDiv.innerHTML = escaped.replace(regex, '<mark>$1</mark>');
+                item.appendChild(snippetDiv);
+
+                resultsEl.appendChild(item);
+            });
+        } catch(e) {}
+    }, 300);
 }
 
 function newChat() {
@@ -630,7 +1124,7 @@ function newChat() {
 // ========== Tarif Defteri Agaci ==========
 async function loadBookTree() {
     try {
-        var res = await fetch('/api/books-tree?user_id=' + userId);
+        var res = await authFetch('/api/books-tree');
         var books = await res.json();
         bookTreeEl.innerHTML = '';
         if (books.length === 0) {
@@ -688,13 +1182,13 @@ async function loadBookTree() {
 }
 
 async function deleteBook(id) {
-    await fetch('/api/books/' + id + '?user_id=' + (userId || ''), { method: 'DELETE' });
+    await authFetch('/api/books/' + id, { method: 'DELETE' });
     showToast('Defter silindi');
     loadBookTree();
 }
 
 async function deleteFolder(id) {
-    await fetch('/api/folders/' + id, { method: 'DELETE' });
+    await authFetch('/api/folders/' + id, { method: 'DELETE' });
     showToast('Klasor silindi');
     loadBookTree();
 }
@@ -702,10 +1196,10 @@ async function deleteFolder(id) {
 function promptNewBook() {
     var name = prompt('Yeni defter adi:');
     if (!name) return;
-    fetch('/api/books', {
+    authFetch('/api/books', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: userId, name: name })
+        body: JSON.stringify({ name: name })
     }).then(function() { loadBookTree(); showToast('Defter olusturuldu!'); });
 }
 
@@ -722,7 +1216,7 @@ function searchSavedRecipes() {
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(async function() {
         try {
-            var res = await fetch('/api/saved-recipes/search?user_id=' + userId + '&q=' + encodeURIComponent(q));
+            var res = await authFetch('/api/saved-recipes/search?q=' + encodeURIComponent(q));
             var results = await res.json();
             resultsEl.innerHTML = '';
             if (results.length === 0) {
@@ -760,7 +1254,7 @@ function createStarRating(recipeId, currentRating) {
         star.setAttribute('data-value', i);
         (function(val) {
             star.onclick = function() {
-                fetch('/api/saved-recipes/' + recipeId + '/rate', {
+                authFetch('/api/saved-recipes/' + recipeId + '/rate', {
                     method: 'PUT',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({rating: val})
@@ -792,7 +1286,7 @@ async function openFolder(folderId, folderName, bookId, bookName) {
     content.innerHTML = '<p>Yukleniyor...</p>';
 
     try {
-        var res = await fetch('/api/folders/' + folderId + '/recipes');
+        var res = await authFetch('/api/folders/' + folderId + '/recipes');
         var recipes = await res.json();
         if (recipes.length === 0) {
             content.innerHTML = '<div class="empty-state">Bu klasorde tarif yok.</div>';
@@ -848,7 +1342,7 @@ async function openFolder(folderId, folderName, bookId, bookName) {
             delBtn.textContent = '\uD83D\uDDD1';
             delBtn.onclick = function() {
                 confirmDelete('Bu tarifi silmek istediginize emin misiniz?', function() {
-                    fetch('/api/saved-recipes/' + r.id, { method: 'DELETE' }).then(function() {
+                    authFetch('/api/saved-recipes/' + r.id, { method: 'DELETE' }).then(function() {
                         card.remove();
                         showToast('Tarif silindi');
                         loadBookTree();
@@ -867,15 +1361,6 @@ async function openFolder(folderId, folderName, bookId, bookName) {
             body.innerHTML = safeMarkdown(r.content);
             card.appendChild(body);
 
-            // Shopping list button
-            var shopBtn = document.createElement('button');
-            shopBtn.className = 'recipe-card-shopping-btn';
-            shopBtn.textContent = '\uD83D\uDED2 Alisveris Listesine Ekle';
-            (function(recipeContent) {
-                shopBtn.onclick = function() { addToShoppingList(recipeContent); };
-            })(r.content);
-            card.appendChild(shopBtn);
-
             content.appendChild(card);
         });
     } catch(e) { content.innerHTML = '<p>Hata olustu.</p>'; }
@@ -886,7 +1371,7 @@ async function openFolder(folderId, folderName, bookId, bookName) {
 // ========== Tarif Paylasimi ==========
 async function shareRecipe(recipeId) {
     try {
-        var res = await fetch('/api/saved-recipes/' + recipeId + '/share', { method: 'POST' });
+        var res = await authFetch('/api/saved-recipes/' + recipeId + '/share', { method: 'POST' });
         var data = await res.json();
         if (data.share_url) {
             navigator.clipboard.writeText(data.share_url).then(function() {
@@ -933,7 +1418,7 @@ function startEditRecipe(card, recipe) {
         var newContent = textarea.value.trim();
         if (!newTitle || !newContent) { showToast('Baslik ve icerik bos olamaz'); return; }
         try {
-            var res = await fetch('/api/saved-recipes/' + recipe.id, {
+            var res = await authFetch('/api/saved-recipes/' + recipe.id, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ title: newTitle, content: newContent })
@@ -980,7 +1465,7 @@ async function openProfilePanel() {
 
     // Load profile data
     try {
-        var res = await fetch('/api/auth/profile?user_id=' + userId);
+        var res = await authFetch('/api/auth/profile');
         var data = await res.json();
         document.getElementById('profileInfoUserId').textContent = data.user_id || '-';
         document.getElementById('profileInfoCreatedAt').textContent = data.created_at ? new Date(data.created_at).toLocaleDateString('tr-TR', {year:'numeric', month:'long', day:'numeric'}) : '-';
@@ -1031,10 +1516,10 @@ async function saveProfilePersonal() {
         return;
     }
     try {
-        var res = await fetch('/api/auth/profile', {
+        var res = await authFetch('/api/auth/profile', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, first_name: firstName, last_name: lastName, birth_date: birthDate })
+            body: JSON.stringify({ first_name: firstName, last_name: lastName, birth_date: birthDate })
         });
         var data = await res.json();
         if (!res.ok) {
@@ -1060,10 +1545,10 @@ async function saveProfileEmail() {
         return;
     }
     try {
-        var res = await fetch('/api/auth/profile', {
+        var res = await authFetch('/api/auth/profile', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, email: email })
+            body: JSON.stringify({ email: email })
         });
         var data = await res.json();
         if (!res.ok) {
@@ -1095,10 +1580,10 @@ async function saveProfileUsername() {
         return;
     }
     try {
-        var res = await fetch('/api/auth/profile', {
+        var res = await authFetch('/api/auth/profile', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, username: newUsername })
+            body: JSON.stringify({ username: newUsername })
         });
         var data = await res.json();
         if (!res.ok) {
@@ -1132,10 +1617,10 @@ async function saveProfilePassword() {
         return;
     }
     try {
-        var res = await fetch('/api/auth/password', {
+        var res = await authFetch('/api/auth/password', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, old_password: oldPw, new_password: newPw })
+            body: JSON.stringify({ old_password: oldPw, new_password: newPw })
         });
         var data = await res.json();
         if (!res.ok) {
@@ -1158,7 +1643,7 @@ var trashCount = 0;
 
 async function loadTrashCount() {
     try {
-        var res = await fetch('/api/trash?user_id=' + (userId || ''));
+        var res = await authFetch('/api/trash');
         var items = await res.json();
         trashCount = items.length;
         var badge = document.getElementById('trashBadge');
@@ -1179,7 +1664,7 @@ async function openTrashPanel() {
     content.innerHTML = '<p>Yukleniyor...</p>';
 
     try {
-        var res = await fetch('/api/trash?user_id=' + (userId || ''));
+        var res = await authFetch('/api/trash');
         var items = await res.json();
         content.innerHTML = '';
 
@@ -1248,7 +1733,7 @@ function closeTrashPanel() {
 
 async function restoreSession(sessionId) {
     try {
-        await fetch('/api/trash/' + sessionId + '/restore', { method: 'POST' });
+        await authFetch('/api/trash/' + sessionId + '/restore', { method: 'POST' });
         showToast('Sohbet geri yuklendi!');
         openTrashPanel();
         loadSessions();
@@ -1258,7 +1743,7 @@ async function restoreSession(sessionId) {
 
 async function permanentDeleteSession(sessionId) {
     try {
-        await fetch('/api/trash/' + sessionId + '/permanent', { method: 'DELETE' });
+        await authFetch('/api/trash/' + sessionId + '/permanent', { method: 'DELETE' });
         showToast('Sohbet kalici olarak silindi');
         openTrashPanel();
         loadTrashCount();
@@ -1268,7 +1753,7 @@ async function permanentDeleteSession(sessionId) {
 async function emptyTrash() {
     confirmDelete('Cop kutusundaki tum sohbetler kalici olarak silinecek. Emin misiniz?', async function() {
         try {
-            await fetch('/api/trash/empty?user_id=' + (userId || ''), { method: 'DELETE' });
+            await authFetch('/api/trash/empty', { method: 'DELETE' });
             showToast('Cop kutusu bosaltildi');
             openTrashPanel();
             loadTrashCount();
@@ -1298,7 +1783,7 @@ function openFavModal(recipeText) {
 function closeFavModal() { document.getElementById('favModal').style.display = 'none'; }
 
 async function loadFavTree() {
-    var res = await fetch('/api/books-tree?user_id=' + userId);
+    var res = await authFetch('/api/books-tree');
     favTreeData = await res.json();
     var bookSel = document.getElementById('favBookSelect');
     bookSel.innerHTML = '<option value="">-- Defter secin --</option>';
@@ -1326,10 +1811,10 @@ function inlineNewBook() {
     inp.focus();
     inp.onkeydown = async function(e) {
         if (e.key === 'Enter' && inp.value.trim()) {
-            await fetch('/api/books', {
+            await authFetch('/api/books', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ user_id: userId, name: inp.value.trim() })
+                body: JSON.stringify({ name: inp.value.trim() })
             });
             inp.value = '';
             inp.style.display = 'none';
@@ -1350,7 +1835,7 @@ function inlineNewFolder() {
     inp.focus();
     inp.onkeydown = async function(e) {
         if (e.key === 'Enter' && inp.value.trim()) {
-            await fetch('/api/books/' + bookId + '/folders', {
+            await authFetch('/api/books/' + bookId + '/folders', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: inp.value.trim() })
@@ -1375,14 +1860,14 @@ async function saveFavorite() {
 
     if (folderId) {
         // Klasor secildiyse direkt klasore kaydet
-        await fetch('/api/folders/' + folderId + '/recipes', {
+        await authFetch('/api/folders/' + folderId + '/recipes', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ title: title, content: favContent, source_session: sessionId })
         });
     } else {
         // Klasor secilmediyse deftere direkt kaydet ("Genel" klasorune)
-        await fetch('/api/books/' + bookId + '/save-recipe', {
+        await authFetch('/api/books/' + bookId + '/save-recipe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ title: title, content: favContent, source_session: sessionId })
@@ -1511,7 +1996,7 @@ function createEditBtn(msgElement, text) {
         toRemove.forEach(function(el) { el.remove(); });
         // Veritabanindan sil
         if (sessionId && toRemove.length > 0) {
-            fetch('/api/sessions/' + sessionId + '/rewind?count=' + toRemove.length, { method: 'DELETE' });
+            authFetch('/api/sessions/' + sessionId + '/rewind?count=' + toRemove.length, { method: 'DELETE' });
         }
         // Metni input'a koy
         inputEl.value = text;
@@ -1528,7 +2013,7 @@ function createShareBtn(text) {
     btn.title = 'Paylas';
     btn.onclick = async function() {
         try {
-            var res = await fetch('/api/messages/share', {
+            var res = await authFetch('/api/messages/share', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ content: text })
@@ -1610,7 +2095,7 @@ function isRecipeResponse(text) {
 async function updateMessageLimit() {
     if (!userId) return;
     try {
-        var res = await fetch('/api/chat/limit?user_id=' + userId);
+        var res = await authFetch('/api/chat/limit');
         var data = await res.json();
         var bar = document.getElementById('messageLimitBar');
         var text = document.getElementById('messageLimitText');
@@ -1675,10 +2160,10 @@ async function sendMessage() {
     assistantDiv.appendChild(contentDiv);
 
     try {
-        var res = await fetch('/api/chat/stream', {
+        var res = await authFetch('/api/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: message, session_id: sessionId, user_id: userId })
+            body: JSON.stringify({ message: message, session_id: sessionId })
         });
 
         // Limit asildiysa
@@ -1881,10 +2366,10 @@ function toggleShoppingSection() {
 // ========== Alisveris Listesi ==========
 async function addToShoppingList(recipeContent) {
     try {
-        var res = await fetch('/api/shopping-lists/from-recipe', {
+        var res = await authFetch('/api/shopping-lists/from-recipe', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({user_id: userId, recipe_content: recipeContent})
+            body: JSON.stringify({recipe_content: recipeContent})
         });
         var data = await res.json();
         showToast('Alisveris listesi olusturuldu!');
@@ -1898,7 +2383,7 @@ async function loadShoppingLists() {
     var container = document.getElementById('shoppingListContainer');
     if (!container) return;
     try {
-        var res = await fetch('/api/shopping-lists?user_id=' + userId);
+        var res = await authFetch('/api/shopping-lists');
         var lists = await res.json();
         container.innerHTML = '';
         if (!lists || lists.length === 0) {
@@ -1917,7 +2402,7 @@ async function loadShoppingLists() {
             delBtn.onclick = function(e) {
                 e.stopPropagation();
                 confirmDelete('Bu alisveris listesini silmek istediginize emin misiniz?', function() {
-                    fetch('/api/shopping-lists/' + list.id, { method: 'DELETE' }).then(function() {
+                    authFetch('/api/shopping-lists/' + list.id, { method: 'DELETE' }).then(function() {
                         showToast('Liste silindi');
                         loadShoppingLists();
                     });
@@ -1935,7 +2420,7 @@ var shoppingListViewerOpen = false;
 
 async function viewShoppingList(listId) {
     try {
-        var res = await fetch('/api/shopping-lists/' + listId);
+        var res = await authFetch('/api/shopping-lists/' + listId);
         var data = await res.json();
         var items = data.items || [];
         var title = data.title || 'Alisveris Listesi';
@@ -1981,8 +2466,11 @@ function updateProfileUI() {
 }
 
 function logoutUser() {
+    fetch('/api/auth/logout', { method: 'POST' }).catch(function() {});
+    localStorage.removeItem('authToken');
     localStorage.removeItem('userId');
     localStorage.removeItem('username');
+    authToken = null;
     userId = null;
     currentUsername = '';
     sessionId = null;
@@ -2026,7 +2514,9 @@ document.addEventListener('keydown', function(e) {
 // Init
 updateProfileUI();
 checkAuth();
-loadSessions();
-loadTrashCount();
 renderSuggestions();
-updateMessageLimit();
+if (authToken) {
+    loadSessions();
+    loadTrashCount();
+    updateMessageLimit();
+}
